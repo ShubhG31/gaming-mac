@@ -115,7 +115,7 @@ wmtr_init(void) {
   blobs[0].base = base; blobs[0].size = WMTR_RING_BLOB_BYTES; blobs[0].id = 0;
   if (T->release_blob) {
     const char *k = getenv("WMTR_ARENA_KEEP_MB"), *tm = getenv("WMTR_ARENA_TRIM_MS");
-    int keep_mb = k && *k ? env_int(k) : 128, trim_ms = tm && *tm ? env_int(tm) : 1000;
+    int keep_mb = k && *k ? env_int(k) : 128, trim_ms = tm && *tm ? env_int(tm) : 5000;
     if (keep_mb >= 0) arena_keep_bytes = (uint64_t)keep_mb << 20;
     if (trim_ms >= 0) arena_trim_ns = (uint64_t)trim_ms * 1000000ull;
   }
@@ -447,16 +447,21 @@ send_built_flags(uint16_t call, uint16_t extra_flags, void *params, uint32_t par
   memcpy(dst + poff, B.buf, B.len);
   __atomic_store_n(&R->head, head + total, __ATOMIC_RELEASE);
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
-  if (wmtr_claim_kick(&R->host_idle)) T->kick(T);
+  int need_kick = wmtr_claim_kick(&R->host_idle);
   pthread_mutex_unlock(&ring_lock);
+  if (need_kick) T->kick(T);
 
   if (!sync) return STATUS_SUCCESS;
   struct wmtr_slot *s = &slots[slot];
   if (__atomic_load_n(&s->done_seq, __ATOMIC_ACQUIRE) < seq) {
-    __atomic_store_n(&s->waiting, 1, __ATOMIC_SEQ_CST);
+    /* Spin before arming s->waiting so fast Class S calls never trigger host wakeups / IRQs. */
     int cls = (extra_flags & WMTR_F_CONTROL) || call >= WMTR_NCALLS ? WMTR_CLS_S : call_cls[call];
-    T->wait(T, &s->done_seq, seq, slot, wmtr_spin_budget_ns(cls));
-    __atomic_store_n(&s->waiting, 0, __ATOMIC_RELAXED);
+    if (!wmtr_spin_wait(&s->done_seq, seq, wmtr_spin_budget_ns(cls))) {
+      __atomic_store_n(&s->waiting, 1, __ATOMIC_SEQ_CST);
+      if (__atomic_load_n(&s->done_seq, __ATOMIC_SEQ_CST) < seq)
+        T->wait(T, &s->done_seq, seq, slot, 0);
+      __atomic_store_n(&s->waiting, 0, __ATOMIC_RELAXED);
+    }
   }
   NTSTATUS st = (NTSTATUS)s->status;
   /* copy back: params, restoring the caller's pointer fields, then outputs in order */
@@ -487,6 +492,41 @@ static struct kv tex_fmt[MAPN];        /* texture handle -> WMTPixelFormat */
 static struct kv shader_counts[MAPN];  /* sm50 shader -> NumConstantBuffers | NumArguments << 32 */
 static struct kv host_blobs[4096];     /* compiled bitcode host pointers (key) -> size */
 static pthread_mutex_t map_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Direct-mapped cache of arena-backed MTLBuffer handles -> guest-visible (mem, len) for zero-IPC
+ * MTLBuffer_updateContents (call 107). Call 1 (release) checks the slot atomically without locking. */
+#define BUF_CACHE_N 16384u
+struct buf_entry { _Atomic uint64_t k; uint8_t *mem; uint64_t len; };
+static struct buf_entry buf_cache[BUF_CACHE_N];
+static pthread_mutex_t buf_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uint32_t
+buf_cache_idx(uint64_t k) {
+  return (uint32_t)((k >> 4) * 0x9E3779B1u) & (BUF_CACHE_N - 1);
+}
+
+static void
+buf_cache_put(uint64_t k, void *mem, uint64_t len) {
+  if (!k || !mem || !len) return;
+  uint32_t i = buf_cache_idx(k);
+  pthread_mutex_lock(&buf_cache_lock);
+  atomic_store_explicit(&buf_cache[i].k, 0, memory_order_relaxed);
+  buf_cache[i].mem = mem;
+  buf_cache[i].len = len;
+  atomic_store_explicit(&buf_cache[i].k, k, memory_order_release);
+  pthread_mutex_unlock(&buf_cache_lock);
+}
+
+static inline void
+buf_cache_del(uint64_t k) {
+  if (!k || (k & WMTR_REF_MASK) == WMTR_HANDLE_TAG) return;
+  uint32_t i = buf_cache_idx(k);
+  if (__builtin_expect(atomic_load_explicit(&buf_cache[i].k, memory_order_relaxed) != k, 1)) return;
+  pthread_mutex_lock(&buf_cache_lock);
+  if (atomic_load_explicit(&buf_cache[i].k, memory_order_relaxed) == k)
+    atomic_store_explicit(&buf_cache[i].k, 0, memory_order_release);
+  pthread_mutex_unlock(&buf_cache_lock);
+}
 
 static void
 map_put(struct kv *m, uint32_t n, uint64_t k, uint64_t v) {
@@ -604,12 +644,49 @@ listener_run(uint64_t listener) {
 
 static uint32_t
 cmd_size(int kind, uint16_t type) {
-#define CMD(k, e, s) if (kind == WMTR_KIND_##k && type == e) return sizeof(struct s);
-  enum { WMTR_KIND_BLIT, WMTR_KIND_COMPUTE, WMTR_KIND_RENDER };
+  if (type == 0) return sizeof(struct wmtcmd_base);
+  switch (kind) {
+  case 0:
+    switch (type) {
+#define CMD_BLIT(e, s) case e: return sizeof(struct s);
+#define CMD_COMPUTE(e, s)
+#define CMD_RENDER(e, s)
+#define CMD(k, e, s) CMD_##k(e, s)
 #include "wmtr_cmds.inc"
 #undef CMD
-  if (type == 0) return sizeof(struct wmtcmd_base);
-  return 0;
+#undef CMD_BLIT
+#undef CMD_COMPUTE
+#undef CMD_RENDER
+    default: return 0;
+    }
+  case 1:
+    switch (type) {
+#define CMD_BLIT(e, s)
+#define CMD_COMPUTE(e, s) case e: return sizeof(struct s);
+#define CMD_RENDER(e, s)
+#define CMD(k, e, s) CMD_##k(e, s)
+#include "wmtr_cmds.inc"
+#undef CMD
+#undef CMD_BLIT
+#undef CMD_COMPUTE
+#undef CMD_RENDER
+    default: return 0;
+    }
+  case 2:
+    switch (type) {
+#define CMD_BLIT(e, s)
+#define CMD_COMPUTE(e, s)
+#define CMD_RENDER(e, s) case e: return sizeof(struct s);
+#define CMD(k, e, s) CMD_##k(e, s)
+#include "wmtr_cmds.inc"
+#undef CMD
+#undef CMD_BLIT
+#undef CMD_COMPUTE
+#undef CMD_RENDER
+    default: return 0;
+    }
+  default: return 0;
+  }
 }
 
 /* copy a command list into extra; `next` and the embedded data pointers become relocations */
@@ -729,10 +806,19 @@ send_client_handle(uint16_t call, void *params, uint32_t size) {
     ret_off = OFF(struct unixcall_generic_obj_ret, ret);
   } else {
     handle = WMTR_HANDLE_TAG | ((atomic_fetch_add_explicit(&next_handle, 1, memory_order_relaxed) + 1) & (WMTR_HANDLE_POOL - 1));
-    ret_off = call == 30 ? OFF(struct unixcall_generic_obj_obj_ret, ret) : OFF(struct unixcall_generic_obj_uint64_obj_ret, ret);
-    if (call == 32)
-      b_in(OFF(struct unixcall_generic_obj_uint64_obj_ret, arg),
-           (const void *)(uintptr_t)((struct unixcall_generic_obj_uint64_obj_ret *)params)->arg, sizeof(struct WMTRenderPassInfo));
+    if (call == 11 || call == 30)
+      ret_off = OFF(struct unixcall_generic_obj_obj_ret, ret);
+    else if (call == 129) {
+      struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers *p = params;
+      ret_off = OFF(struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers, ret);
+      b_in(OFF(struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers, attachments),
+           p->attachments.ptr, p->num_attachments * sizeof(struct WMTSampleBufferAttachmentInfo));
+    } else {
+      ret_off = OFF(struct unixcall_generic_obj_uint64_obj_ret, ret);
+      if (call == 32)
+        b_in(OFF(struct unixcall_generic_obj_uint64_obj_ret, arg),
+             (const void *)(uintptr_t)((struct unixcall_generic_obj_uint64_obj_ret *)params)->arg, sizeof(struct WMTRenderPassInfo));
+    }
   }
   memcpy(B.buf + ret_off, &handle, 8);
   memcpy((uint8_t *)params + ret_off, &handle, 8);
@@ -741,7 +827,8 @@ send_client_handle(uint16_t call, void *params, uint32_t size) {
 
 static NTSTATUS
 dispatch(uint16_t call, void *params, uint32_t size, int sync) {
-  if (client_handles && (call == 10 || (call >= 30 && call <= 32))) return send_client_handle(call, params, size);
+  if (client_handles && (call == 10 || call == 11 || (call >= 30 && call <= 32) || call == 129))
+    return send_client_handle(call, params, size);
   switch (call) {
   case 8: { /* NSString_getCString */
     struct unixcall_nsstring_getcstring *p = params;
@@ -770,7 +857,8 @@ dispatch(uint16_t call, void *params, uint32_t size, int sync) {
     if (mem) b_reloc(B.outs[0].off + OFF(struct WMTBufferInfo, memory), WMTR_REF_ARENA | ((uint64_t)blob << 32) | off);
     NTSTATUS st = send_built(call, 1, p, size);
     info->memory.ptr = mem;
-    if (!p->ret && mem) arena_free(blob, off, info->length);
+    if (p->ret && mem) buf_cache_put(p->ret, mem, info->length);
+    else if (!p->ret && mem) arena_free(blob, off, info->length);
     return st;
   }
   case 19: b_begin(params, size); b_out(OFF(struct unixcall_mtldevice_newsamplerstate, info), ((struct unixcall_mtldevice_newsamplerstate *)params)->info.ptr, sizeof(struct WMTSamplerInfo), 1); break;
@@ -890,7 +978,25 @@ dispatch(uint16_t call, void *params, uint32_t size, int sync) {
   case 99: b_begin(params, size); b_out(OFF(struct unixcall_query_display_setting, hdr_metadata), ((struct unixcall_query_display_setting *)params)->hdr_metadata.ptr, sizeof(struct WMTHDRMetadata), 0); break;
   case 100: b_begin(params, size); b_in(OFF(struct unixcall_update_display_setting, hdr_metadata), ((struct unixcall_update_display_setting *)params)->hdr_metadata.ptr, sizeof(struct WMTHDRMetadata)); break;
   case 101: b_begin(params, size); b_out(OFF(struct unixcall_query_display_setting_for_layer, hdr_metadata), ((struct unixcall_query_display_setting_for_layer *)params)->hdr_metadata.ptr, sizeof(struct WMTHDRMetadata), 0); break;
-  case 107: { struct unixcall_mtlbuffer_updatecontents *p = params; b_begin(p, size); b_in(OFF(struct unixcall_mtlbuffer_updatecontents, data), p->data.ptr, p->length); break; }
+  case 107: {
+    struct unixcall_mtlbuffer_updatecontents *p = params;
+    if (!p->length) return STATUS_SUCCESS;
+    if (p->buffer && p->data.ptr) {
+      uint32_t i = buf_cache_idx(p->buffer);
+      if (atomic_load_explicit(&buf_cache[i].k, memory_order_acquire) == p->buffer) {
+        pthread_mutex_lock(&buf_cache_lock);
+        uint8_t *dst = NULL;
+        if (atomic_load_explicit(&buf_cache[i].k, memory_order_relaxed) == p->buffer &&
+            p->offset <= buf_cache[i].len && p->length <= buf_cache[i].len - p->offset)
+          dst = buf_cache[i].mem + p->offset;
+        pthread_mutex_unlock(&buf_cache_lock);
+        if (dst) { memcpy(dst, p->data.ptr, p->length); return STATUS_SUCCESS; }
+      }
+    }
+    b_begin(p, size);
+    b_in(OFF(struct unixcall_mtlbuffer_updatecontents, data), p->data.ptr, p->length);
+    break;
+  }
   case 112: { struct unixcall_mtldevice_newbinaryarchive *p = params; b_begin(p, size); b_cstr(OFF(struct unixcall_mtldevice_newbinaryarchive, url), p->url.ptr); break; }
   case 113: { struct unixcall_mtlbinaryarchive_serialize *p = params; b_begin(p, size); b_cstr(OFF(struct unixcall_mtlbinaryarchive_serialize, url), p->url.ptr); break; }
   case 114: { /* DispatchData_alloc_init(native_ptr, length): copy guest bytes unless it is host bitcode */
@@ -953,6 +1059,7 @@ static const uint32_t call_size[WMTR_NCALLS] = {
 static NTSTATUS
 entry_untraced(uint16_t call, void *params) {
   if (call == 0 || call == 1) { /* retain / release take the handle itself */
+    if (call == 1) buf_cache_del(*(const obj_handle_t *)params);
     b_begin(params, 8);
     return send_built(call, 0, params, 8);
   }

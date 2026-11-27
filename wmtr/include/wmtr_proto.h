@@ -16,7 +16,7 @@
 #define WMTR_PROTO_H
 #include <stdint.h>
 
-#define WMTR_VERSION 2 /* 2: client-assigned handles (WMTR_F_CLIENT_HANDLE) */
+#define WMTR_VERSION 3 /* 3: 128-byte cache-line aligned ring/slots for Apple Silicon */
 #define WMTR_PAGE 16384u                 /* host page size on Apple silicon */
 #define WMTR_RING_BYTES (8u << 20)       /* request ring */
 #define WMTR_SLOTS 64                    /* reply slots (one per client thread) */
@@ -66,11 +66,14 @@ struct wmtr_hello { uint32_t version, slots; uint64_t ring_bytes, slot_bytes; };
 struct wmtr_blob_add { uint32_t blob; uint32_t reserved; uint64_t size; };
 
 struct wmtr_slot {
+  /* Separate 128-byte cache lines (Apple Silicon L1/L2 line size): host writes done_seq/status/out_size,
+   * guest writes waiting; data starts 128-byte aligned so adjacent slots never share a cache line. */
   volatile uint64_t done_seq; /* host stores seq when the reply is complete (release) */
   volatile uint32_t status;   /* NTSTATUS of the call */
   volatile uint32_t out_size; /* params + output bytes written to data */
+  uint8_t pad0[112];
   volatile uint32_t waiting;  /* client sleeps on the transport's wait primitive */
-  uint32_t pad[11];
+  uint8_t pad1[124];
   uint8_t data[WMTR_SLOT_BYTES];
 };
 
@@ -83,20 +86,24 @@ struct wmtr_event { uint64_t listener, event_handle; };
 
 struct wmtr_ring {
   uint32_t magic, version;
+  uint8_t pad_hdr[120];
   volatile uint64_t head;      /* client: bytes produced (monotonic) */
-  uint8_t pad0[48];
+  uint8_t pad0[120];
   volatile uint64_t tail;      /* host: bytes consumed (monotonic) */
+  uint8_t pad1a[120];
   volatile uint32_t host_idle; /* host executor is asleep; the client must kick */
-  uint8_t pad1[44];
+  uint8_t pad1b[124];
   /* host -> client: arena ranges whose MTLBuffer was deallocated (NoCopy deallocator) */
   volatile uint64_t free_head; /* host produced */
+  uint8_t pad2a[120];
   volatile uint64_t free_tail; /* client consumed */
-  uint8_t pad2[48];
+  uint8_t pad2b[120];
   struct wmtr_free_entry free_ring[WMTR_FREE_RING];
   /* host -> client: Win32 events to set (MTLSharedEvent notifications); wait slot WMTR_EVENT_SLOT */
   volatile uint64_t event_head; /* host produced; the client waits on it */
+  uint8_t pad3a[120];
   volatile uint64_t event_tail; /* client consumed */
-  uint8_t pad3[48];
+  uint8_t pad3b[120];
   struct wmtr_event event_ring[WMTR_EVENT_RING];
 };
 

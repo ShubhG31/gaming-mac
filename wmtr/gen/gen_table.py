@@ -35,7 +35,7 @@ for line in out.splitlines():
         idx = table.index(fn)
         if k == 'sm50_get_arguments_info': name, ptype = 'SM50GetArgumentsInfo', 'sm50_get_arguments_info_params'
     rows[idx] = (name, ptype)
-A = {146,0,1,12,17,33,36,37,38,45,46,47,48,55,58,59,64,65,70,73,86,87,100,102,103,104,107,110,118,133,134,135,136,137}
+A = {146,0,1,12,17,33,36,37,38,45,46,47,48,55,58,59,64,65,70,73,75,78,80,86,87,100,102,103,104,107,110,118,133,134,135,136,137}
 B = {13,67,109,126}
 C = {25,26,29,34,35,98,112,131,144}
 for i, t in enumerate(table):

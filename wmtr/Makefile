@@ -15,7 +15,8 @@ OUT ?= build
 CC = clang
 
 INC = -Iinclude -Isrc -I../host/vrhost/include -I../guest/vr/include -I$(DXMT)/src/winemetal -I$(DXMT)/src/airconv
-CFLAGS = -O2 -g -Wall -Wno-unused-function $(INC)
+CFLAGS = -O3 -DNDEBUG -g -Wall -Wno-unused-function $(INC)
+HOST_LTO = -flto=thin
 FRAMEWORKS = -framework Foundation -framework Metal -framework MetalFX -framework QuartzCore -framework Cocoa \
              -framework CoreGraphics -framework ColorSync -framework CoreFoundation -framework IOSurface
 LLVM_LIBS = -L$(LLVM)/lib -lLLVMPasses -lLLVMTarget -lLLVMObjCARCOpts -lLLVMCoroutines -lLLVMipo \
@@ -34,18 +35,18 @@ $(OUT):
 
 # DXMT's unix side, unchanged; its unix-call table becomes wmtr_impl_funcs
 $(OUT)/winemetal_unix.o: $(DXMT)/src/winemetal/unix/winemetal_unix.c | $(OUT)
-	$(CC) $(CFLAGS) -ObjC -D__wine_unix_call_funcs=wmtr_impl_funcs -D__wine_unix_call_wow64_funcs=wmtr_impl_wow64_funcs \
+	$(CC) $(CFLAGS) $(HOST_LTO) -ObjC -D__wine_unix_call_funcs=wmtr_impl_funcs -D__wine_unix_call_wow64_funcs=wmtr_impl_wow64_funcs \
 	  -Wno-deprecated-declarations -c $< -o $@
 $(OUT)/cache.o: $(DXMT)/src/winemetal/unix/cache.c | $(OUT)
-	$(CC) $(CFLAGS) -ObjC -c $< -o $@
+	$(CC) $(CFLAGS) $(HOST_LTO) -ObjC -c $< -o $@
 $(OUT)/wmtr_host.o: src/wmtr_host.m include/*.h src/wmtr_calls.inc src/wmtr_objects.h src/wmtr_objects.inc src/wmtr_object_cmds.inc | $(OUT)
-	$(CC) $(CFLAGS) -ObjC -c $< -o $@
+	$(CC) $(CFLAGS) $(HOST_LTO) -ObjC -c $< -o $@
 $(OUT)/wmtr_vr.o: src/wmtr_vr.m include/wmtr_vr.h ../host/vrhost/include/vrlink.h | $(OUT)
-	$(CC) $(CFLAGS) -ObjC -c $< -o $@
+	$(CC) $(CFLAGS) $(HOST_LTO) -ObjC -c $< -o $@
 
 host: $(OUT)/libwmtr_host.dylib
 $(OUT)/libwmtr_host.dylib: $(OUT)/wmtr_host.o $(OUT)/wmtr_vr.o $(OUT)/winemetal_unix.o $(OUT)/cache.o $(AIRCONV)
-	$(CC) -dynamiclib -install_name @rpath/libwmtr_host.dylib -o $@ $^ $(LLVM_LIBS) $(FRAMEWORKS) -lsqlite3
+	$(CC) $(HOST_LTO) -dynamiclib -install_name @rpath/libwmtr_host.dylib -o $@ $^ $(LLVM_LIBS) $(FRAMEWORKS) -lsqlite3
 	codesign -s - -f $@
 
 test: $(OUT)/wmtr_loopback $(OUT)/wmtr_present_test $(OUT)/wmtr_spin_test $(OUT)/wmtr_lifetime_test $(OUT)/wmtr_dxmt_test $(OUT)/dxmt_test.metallib
@@ -75,8 +76,9 @@ $(OUT)/wmtr_loopback: tests/wmtr_loopback.m src/wmtr_host.m src/wmtr_objects.h s
 # Steam Runtime's and the FEX rootfs's glibc), so the unixlib would not load
 LINUX_ARCH ?= $(firstword $(subst -, ,$(shell $(CC) -dumpmachine)))
 LINUX_TLS = $(if $(filter aarch64,$(LINUX_ARCH)),trad,gnu)
+LINUX_ARCH_FLAGS = $(if $(filter aarch64,$(LINUX_ARCH)),-march=armv8.4-a+lse,)
 LINUX_OUT = $(OUT)/$(LINUX_ARCH)-linux
-LINUX_CFLAGS = -O2 -g -Wall -Wno-unused-function -mtls-dialect=$(LINUX_TLS) $(INC) -include include/wmtr_glibc_compat.h
+LINUX_CFLAGS = -O3 -DNDEBUG -flto -g -Wall -Wno-unused-function -mtls-dialect=$(LINUX_TLS) $(LINUX_ARCH_FLAGS) $(INC) -include include/wmtr_glibc_compat.h
 client-linux: $(LINUX_OUT)/winemetal.so
 $(LINUX_OUT)/winemetal.so: src/wmtr_client.c src/transport_virtgpu.c include/*.h src/*.inc
 	mkdir -p $(LINUX_OUT)

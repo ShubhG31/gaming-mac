@@ -100,6 +100,7 @@ static void stream_capture_present(id<MTLCommandBuffer> cb, id drawable) {
 @end
 
 static void stream_capture_layer_changed(uint16_t call, uint8_t *params) {
+  if (!atomic_load_explicit(&stream_capture_active, memory_order_relaxed)) return;
   CAMetalLayer *layer = (CAMetalLayer *)((struct unixcall_generic_obj_noret *)params)->handle;
   NSNumber *requested = nil;
   if (call == 70) {
@@ -190,7 +191,12 @@ static struct sigaction prev_segv, prev_bus;
 
 static void
 fault_handler(int sig, siginfo_t *si, void *uc) {
-  if (fault_jmp) { fault_addr = si ? si->si_addr : NULL; siglongjmp(*fault_jmp, sig); }
+  if (fault_jmp) {
+    sigjmp_buf *jb = fault_jmp;
+    fault_jmp = NULL;
+    fault_addr = si ? si->si_addr : NULL;
+    siglongjmp(*jb, sig);
+  }
   struct sigaction *prev = sig == SIGBUS ? &prev_bus : &prev_segv;
   if (prev->sa_flags & SA_SIGINFO) { prev->sa_sigaction(sig, si, uc); return; }
   if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) { prev->sa_handler(sig); return; }
@@ -201,7 +207,10 @@ static void
 fault_install(void) {
   struct sigaction sa = {0};
   sa.sa_sigaction = fault_handler;
-  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  /* SA_NODEFER keeps SIGSEGV/SIGBUS unblocked on entry so execute() can use sigsetjmp(jb, 0)
+   * without paying a sigprocmask syscall on every remoted Metal call; fault_jmp is cleared
+   * before siglongjmp so a fault outside a call falls straight through to prev/default. */
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
   sigemptyset(&sa.sa_mask);
   sigaction(SIGSEGV, &sa, &prev_segv);
   sigaction(SIGBUS, &sa, &prev_bus);
@@ -496,11 +505,17 @@ pp_commit(id<MTLCommandBuffer> cb) {
  * HUD only once libMTLHud attached to it, which happens when the layer's first drawable reached the screen.
  * So the view re-applies its policy when a game layer's 1st, 10th and 60th frames are done. */
 static char policy_frames_key;
+static _Atomic uintptr_t policy_done_layer;
 static int
 layer_policy_due(CALayer *layer) {
+  if (__builtin_expect((uintptr_t)layer == atomic_load_explicit(&policy_done_layer, memory_order_relaxed), 1))
+    return 0;
   NSNumber *n = objc_getAssociatedObject(layer, &policy_frames_key);
   int c = n.intValue + 1;
-  if (c > 60) return 0;
+  if (c > 60) {
+    atomic_store_explicit(&policy_done_layer, (uintptr_t)layer, memory_order_relaxed);
+    return 0;
+  }
   objc_setAssociatedObject(layer, &policy_frames_key, @(c), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
   return c == 1 || c == 10 || c == 60;
 }
@@ -855,8 +870,7 @@ push_event(WMTRCallbackState *state, uint64_t listener, uint64_t event_handle) {
 }
 
 static NTSTATUS
-host_call(struct wmtr_host *h, uint16_t call, uint8_t *params, const struct wmtr_req_ext *r, const uint32_t *relocs,
-          const uint64_t *orig) {
+host_call(struct wmtr_host *h, uint16_t call, uint8_t *params, const struct wmtr_req_ext *r, uint64_t arena_ref) {
   /* A stale/reused command-buffer handle used to reach Metal's fatal encoder assertion.
    * Refuse late encoding, and retain the call/slot/status evidence instead of aborting the VM. */
   if (object_checks(h) && (call == 30 || call == 31 || call == 32 || call == 129)) {
@@ -885,12 +899,7 @@ host_call(struct wmtr_host *h, uint16_t call, uint8_t *params, const struct wmtr
         vpool_push(h, r->h.slot, r->h.flags & WMTR_F_CLIENT_HANDLE ? ((struct unixcall_generic_obj_ret *)params)->ret : 0);
     return ((struct unixcall_generic_obj_ret *)params)->ret ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
   case 18: { /* newBuffer: memory field relocation carries the arena reference */
-    uint64_t arena_ref = 0;
     struct unixcall_mtldevice_newbuffer *p = (void *)params;
-    uint32_t mem_field = 0;
-    for (int i = 0; i < r->n_reloc; i++)
-      if ((orig[i] & WMTR_REF_MASK) == WMTR_REF_ARENA) { arena_ref = orig[i]; mem_field = relocs[i]; }
-    (void)mem_field;
     return host_new_buffer(h, p, arena_ref);
   }
   case 47: case 48: /* nextDrawable may return nil (timeout, zero size or unavailable layer). */
@@ -998,8 +1007,9 @@ static int
 handle_ret_off(uint16_t call) {
   switch (call) {
   case 10: return offsetof(struct unixcall_generic_obj_ret, ret);
-  case 30: return offsetof(struct unixcall_generic_obj_obj_ret, ret);
+  case 11: case 30: return offsetof(struct unixcall_generic_obj_obj_ret, ret);
   case 31: case 32: return offsetof(struct unixcall_generic_obj_uint64_obj_ret, ret);
+  case 129: return offsetof(struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers, ret);
   default: return -1;
   }
 }
@@ -1055,8 +1065,27 @@ handle_created(struct wmtr_host *h, const struct wmtr_req_ext *r, uint8_t *paylo
 /* ------------------------------------------------------------------------------------------- */
 struct job { struct wmtr_host *h; uint8_t *copy; uint32_t len; };
 
+/* Calls with no input object fields in wmtr_objects.h / wmtr_objects.inc (skip pre-call object_lock). */
+static const uint8_t call_no_in_obj[WMTR_NCALLS] = {
+    [4] = 1,   [10] = 1,  [53] = 1,  [60] = 1,  [61] = 1,  [62] = 1,  [74] = 1,  [75] = 1,  [76] = 1,
+    [77] = 1,  [78] = 1,  [79] = 1,  [80] = 1,  [81] = 1,  [82] = 1,  [83] = 1,  [84] = 1,  [85] = 1,
+    [88] = 1,  [92] = 1,  [94] = 1,  [95] = 1,  [96] = 1,  [99] = 1,  [100] = 1, [108] = 1, [111] = 1,
+    [114] = 1, [115] = 1, [117] = 1, [119] = 1, [121] = 1, [122] = 1,
+};
+
+/* Calls that export, retain, release, or end-encode tracked objects (skip post-call object_lock otherwise). */
+static const uint8_t call_has_post_obj[WMTR_NCALLS] = {
+    [0] = 1,   [1] = 1,   [2] = 1,   [4] = 1,   [7] = 1,   [9] = 1,   [11] = 1,  [15] = 1,  [18] = 1,
+    [19] = 1,  [20] = 1,  [21] = 1,  [22] = 1,  [23] = 1,  [25] = 1,  [26] = 1,  [28] = 1,  [29] = 1,
+    [30] = 1,  [31] = 1,  [32] = 1,  [33] = 1,  [34] = 1,  [35] = 1,  [53] = 1,  [56] = 1,  [57] = 1,
+    [60] = 1,  [61] = 1,  [62] = 1,  [66] = 1,  [67] = 1,  [71] = 1,  [72] = 1,  [73] = 1,  [89] = 1,
+    [90] = 1,  [91] = 1,  [98] = 1,  [105] = 1, [106] = 1, [108] = 1, [112] = 1, [113] = 1, [114] = 1,
+    [115] = 1, [116] = 1, [117] = 1, [120] = 1, [124] = 1, [127] = 1, [129] = 1, [131] = 1, [132] = 1,
+    [138] = 1, [141] = 1, [142] = 1, [143] = 1, [144] = 1,
+};
+
 static void
-execute(struct wmtr_host *h, uint8_t *rec, uint32_t len) {
+execute_impl(struct wmtr_host *h, uint8_t *rec, uint32_t len, int on_worker) {
   if (atomic_load_explicit(&h->n_free_ovf_hint, memory_order_relaxed)) {
     pthread_mutex_lock(&h->callbacks->lock);
     flush_free_ovf_locked(h);
@@ -1073,16 +1102,14 @@ execute(struct wmtr_host *h, uint8_t *rec, uint32_t len) {
     reply(h, r, outs, 0, NULL, STATUS_INVALID_PARAMETER);
     return;
   }
-  uint64_t orig_small[512];
-  uint64_t *orig = r->n_reloc <= 512 ? orig_small : malloc(8u * r->n_reloc);
   int nr = r->n_reloc;
   NTSTATUS st = STATUS_SUCCESS;
-  uint64_t w0 = 0, cid = 0;
+  uint64_t w0 = 0, cid = 0, arena_ref = 0;
   for (int i = 0; i < nr; i++) {
     if (r->payload_size < 8 || relocs[i] > r->payload_size - 8) { st = STATUS_INVALID_PARAMETER; break; }
     uint64_t v;
     memcpy(&v, payload + relocs[i], 8);
-    orig[i] = v;
+    if ((v & WMTR_REF_MASK) == WMTR_REF_ARENA) arena_ref = v;
     void *p = v ? resolve(h, v, payload, r->payload_size) : NULL;
     if (v && !p) { st = STATUS_INVALID_PARAMETER; LOG(0, "call %u: bad reference %llx\n", r->h.call, (unsigned long long)v); break; }
     memcpy(payload + relocs[i], &p, 8);
@@ -1104,22 +1131,23 @@ execute(struct wmtr_host *h, uint8_t *rec, uint32_t len) {
       } else {
         struct object_walk walk = {h, payload, r->payload_size, OBJECT_VALIDATE, r->h.call};
         int leased = 0;
-        if (object_checks(h)) {
+        if (object_checks(h) && !call_no_in_obj[r->h.call]) {
           pthread_mutex_lock(&h->object_lock);
           int valid = objects_walk(&walk, payload, 0);
-          if (valid) { walk.mode = OBJECT_LEASE; valid = objects_walk(&walk, payload, 0); leased = valid; }
+          /* Only worker-queue calls can race pool drain/release (which run strictly on the executor). */
+          if (valid && on_worker) { walk.mode = OBJECT_LEASE; valid = objects_walk(&walk, payload, 0); leased = valid; }
           pthread_mutex_unlock(&h->object_lock);
           if (!valid) { st = STATUS_INVALID_HANDLE; goto call_done; }
         }
         sigjmp_buf jb;
-        if (sigsetjmp(jb, 1) == 0) {
+        if (sigsetjmp(jb, 0) == 0) {
           fault_jmp = &jb;
           int cs = callstats_on();
           uint64_t t0 = cs ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) : 0;
           @autoreleasepool {
             @try {
-              st = host_call(h, r->h.call, payload, r, relocs, orig);
-              if (object_checks(h) && st == STATUS_SUCCESS) {
+              st = host_call(h, r->h.call, payload, r, arena_ref);
+              if (object_checks(h) && st == STATUS_SUCCESS && call_has_post_obj[r->h.call]) {
                 walk.mode = OBJECT_EXPORT;
                 pthread_mutex_lock(&h->object_lock);
                 if (r->h.call == 0 && !is_vpool(h, *(uint64_t *)payload))
@@ -1139,7 +1167,7 @@ execute(struct wmtr_host *h, uint8_t *rec, uint32_t len) {
           if (cs) callstats_add(r->h.call, r->h.flags & WMTR_F_SYNC, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
           fault_jmp = NULL;
           if (cid) handle_created(h, r, payload, cid);
-          uint32_t ti = atomic_fetch_add(&h->trace_n, 1) % 128;
+          uint32_t ti = atomic_fetch_add_explicit(&h->trace_n, 1, memory_order_relaxed) % 128;
           h->trace[ti].call = r->h.call; h->trace[ti].slot = r->h.slot; h->trace[ti].st = (uint32_t)st;
           for (int k = 0; k < 4; k++) h->trace[ti].q[k] = r->h.params_size >= 8u * (k + 1) ? ((const uint64_t *)payload)[k] : 0;
         } else {
@@ -1150,7 +1178,7 @@ execute(struct wmtr_host *h, uint8_t *rec, uint32_t len) {
                  "client's calls from now on\n", r->h.call, fault_addr, (unsigned long long)(r->h.params_size >= 8 ? q[0] : 0),
               (unsigned long long)(r->h.params_size >= 16 ? q[1] : 0), (unsigned long long)(r->h.params_size >= 24 ? q[2] : 0),
               (unsigned long long)(r->h.params_size >= 32 ? q[3] : 0));
-          uint32_t tn = atomic_load(&h->trace_n);
+          uint32_t tn = atomic_load_explicit(&h->trace_n, memory_order_relaxed);
           for (uint32_t k = tn > 128 ? tn - 128 : 0; k < tn; k++) {
             uint32_t ti = k % 128;
             LOG(0, "  before: call %u slot %u st %x: %llx %llx %llx %llx\n", h->trace[ti].call, h->trace[ti].slot, h->trace[ti].st,
@@ -1172,13 +1200,17 @@ call_done:;
   }
   if (w0) memcpy(payload, &w0, 8); /* the caller gets its own handle back */
   reply(h, r, outs, r->n_out, payload, st);
-  if (orig != orig_small) free(orig);
+}
+
+static void
+execute(struct wmtr_host *h, uint8_t *rec, uint32_t len) {
+  execute_impl(h, rec, len, 0);
 }
 
 static void
 job_run(void *arg) {
   struct job *j = arg;
-  execute(j->h, j->copy, j->len);
+  execute_impl(j->h, j->copy, j->len, 1);
   free(j->copy);
   free(j);
 }
@@ -1197,17 +1229,21 @@ executor(void *arg) {
       /* poll for the spin budget, then sleep until kicked: a sleeping executor costs the next request a kick
        * (a virtio-gpu submission and a VM exit in the guest), a polling one costs host CPU */
       int got = 0;
-      uint64_t end = mach_absolute_time() + atomic_load_explicit(&h->spin_ticks, memory_order_relaxed);
-      do {
-        if (__atomic_load_n(&R->head, __ATOMIC_ACQUIRE) != tail) { got = 1; break; }
-        __asm__ __volatile__("yield");
-      } while (mach_absolute_time() < end);
+      uint64_t spin = atomic_load_explicit(&h->spin_ticks, memory_order_relaxed);
+      if (spin) {
+        uint64_t end = mach_absolute_time() + spin;
+        for (unsigned i = 1;; i++) {
+          if (__atomic_load_n(&R->head, __ATOMIC_ACQUIRE) != tail) { got = 1; break; }
+          __asm__ __volatile__("yield");
+          if (!(i & 63) && mach_absolute_time() >= end) break;
+        }
+      }
       if (got) continue;
       pthread_mutex_lock(&h->lock);
       __atomic_store_n(&R->host_idle, 1, __ATOMIC_SEQ_CST);
       __atomic_thread_fence(__ATOMIC_SEQ_CST);
       while (!h->quit && !h->kicked && __atomic_load_n(&R->head, __ATOMIC_ACQUIRE) == tail) {
-        atomic_fetch_add(&h->n_sleep, 1);
+        atomic_fetch_add_explicit(&h->n_sleep, 1, memory_order_relaxed);
         if (cs_state == 1) atomic_fetch_add_explicit(&cs_sleeps, 1, memory_order_relaxed);
         pthread_cond_wait(&h->cond, &h->lock);
       }
@@ -1228,23 +1264,45 @@ executor(void *arg) {
       LOG(0, "ring corrupt at %llu (size %u); stopping\n", (unsigned long long)tail, hdr.size);
       break;
     }
-    if (hdr.size > scratch_cap) { scratch_cap = hdr.size; scratch = realloc(scratch, scratch_cap + WMTR_COPY_SLACK); }
-    memcpy(scratch, h->data + pos, hdr.size);
-    memset(scratch + hdr.size, 0, WMTR_COPY_SLACK);
-    __atomic_store_n(&R->tail, tail + hdr.size, __ATOMIC_RELEASE);
-    atomic_fetch_add(&h->n_req, 1);
-    atomic_fetch_add(&h->n_bytes, hdr.size);
-    if (hdr.flags & WMTR_F_SYNC) atomic_fetch_add(&h->n_sync, 1);
+    atomic_fetch_add_explicit(&h->n_req, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&h->n_bytes, hdr.size, memory_order_relaxed);
+    if (hdr.flags & WMTR_F_SYNC) atomic_fetch_add_explicit(&h->n_sync, 1, memory_order_relaxed);
     uint8_t cls = hdr.call < WMTR_NCALLS && !(hdr.flags & WMTR_F_CONTROL) ? call_class[hdr.call] : WMTR_CLASS_S;
     if (cls == WMTR_CLASS_B || cls == WMTR_CLASS_C) {
       struct job *j = malloc(sizeof *j);
-      j->h = h; j->len = hdr.size; j->copy = calloc(1, hdr.size + WMTR_COPY_SLACK);
-      memcpy(j->copy, scratch, hdr.size);
-      atomic_fetch_add(&h->n_worker, 1);
+      uint8_t *copy = j ? malloc(hdr.size + WMTR_COPY_SLACK) : NULL;
+      if (!j || !copy) {
+        free(copy);
+        free(j);
+        LOG(0, "ring OOM allocating job (size %u); stopping\n", hdr.size);
+        break;
+      }
+      j->h = h; j->len = hdr.size; j->copy = copy;
+      memcpy(copy, h->data + pos, hdr.size);
+      /* Pin the validated header against concurrent guest shared-memory mutation (double-fetch TOCTOU). */
+      memcpy(copy, &hdr, sizeof hdr);
+      memset(copy + hdr.size, 0, WMTR_COPY_SLACK);
+      __atomic_store_n(&R->tail, tail + hdr.size, __ATOMIC_RELEASE);
+      atomic_fetch_add_explicit(&h->n_worker, 1, memory_order_relaxed);
       dispatch_async_f(cls == WMTR_CLASS_B ? h->block_q : h->compile_q, j, job_run);
       continue;
     }
-    execute(h, scratch, hdr.size);
+    if (hdr.size > scratch_cap) {
+      uint8_t *next = realloc(scratch, hdr.size + WMTR_COPY_SLACK);
+      if (!next) {
+        LOG(0, "ring OOM growing scratch (size %u); stopping\n", hdr.size);
+        break;
+      }
+      scratch = next;
+      scratch_cap = hdr.size;
+    }
+    memcpy(scratch, h->data + pos, hdr.size);
+    /* Pin the validated header against concurrent guest shared-memory mutation (double-fetch TOCTOU). */
+    memcpy(scratch, &hdr, sizeof hdr);
+    __atomic_store_n(&R->tail, tail + hdr.size, __ATOMIC_RELEASE);
+    /* Zero full slack for calls with relocations (WMTR_REF_EXTRA reads), and 256 B tail guard otherwise. */
+    memset(scratch + hdr.size, 0, ((const struct wmtr_req_ext *)scratch)->n_reloc ? WMTR_COPY_SLACK : 256u);
+    execute_impl(h, scratch, hdr.size, 0);
   }
   free(scratch);
   return NULL;
@@ -1335,7 +1393,11 @@ wmtr_host_create(void *ring, const struct wmtr_host_ops *ops, void *ctx) {
   h->callbacks = [[WMTRCallbackState alloc] init];
   h->callbacks->host = h;
   pthread_mutex_init(&h->view_lock, NULL);
-  h->compile_q = dispatch_queue_create("wmtr.compile", DISPATCH_QUEUE_CONCURRENT);
+  /* Keep shader/pipeline compilation below USER_INTERACTIVE so compile bursts do not preempt
+   * the executor or vCPU threads during gameplay. */
+  dispatch_queue_attr_t compile_attr =
+      dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0);
+  h->compile_q = dispatch_queue_create("wmtr.compile", compile_attr);
   h->block_q = dispatch_queue_create("wmtr.block", DISPATCH_QUEUE_CONCURRENT);
   pthread_attr_t a;
   pthread_attr_init(&a);
@@ -1507,11 +1569,11 @@ wmtr_present_create_view(void *ctx, uint64_t hwnd, void *device, uint64_t *layer
         layer.contentsGravity = kCAGravityResizeAspect;
         layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
         layer.opaque = YES;
-        /* drawables the game layer may have in flight: 2 (WMTR_DRAWABLES=3 restores Core Animation's default).
-         * d3d11bench probe, DXMT, 60 Hz panel: app-reaction-to-present median 48.6 -> 41.3 ms, p90 52.1 -> 42.2 ms,
-         * presented fps unchanged (119 vs 119) */
+        /* Triple-buffer game drawables by default to prevent nextDrawable stalls at 120 Hz and
+         * near-VSync GPU frame times; WMTR_DRAWABLES=2 opts into lower-latency double buffering. */
         const char *nd = getenv("WMTR_DRAWABLES");
-        ((CAMetalLayer *)layer).maximumDrawableCount = nd && atoi(nd) == 3 ? 3 : 2;
+        ((CAMetalLayer *)layer).maximumDrawableCount = nd && atoi(nd) == 2 ? 2 : 3;
+        atomic_store_explicit(&policy_done_layer, 0, memory_order_relaxed);
         /* the launcher shows game layers only while a game has the guest's focus (VMView.gameLayersVisible) */
         if ([vm respondsToSelector:@selector(gameLayersVisible)])
           layer.hidden = ![[vm valueForKey:@"gameLayersVisible"] boolValue];
@@ -1550,6 +1612,7 @@ wmtr_present_release_view(void *ctx, uint64_t v) {
   const char *mode = getenv("WMTR_PRESENT");
   int overlay = mode && !strcmp(mode, "overlay");
   dispatch_async(dispatch_get_main_queue(), ^{
+    atomic_store_explicit(&policy_done_layer, 0, memory_order_relaxed);
     if (overlay) {
       for (CALayer *l in [[view.layer sublayers] copy])
         if ([l isKindOfClass:[CAMetalLayer class]] && l != view.layer) [l removeFromSuperlayer];

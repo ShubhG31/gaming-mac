@@ -67,6 +67,7 @@ wmtr_spin_wait(volatile uint64_t *done, uint64_t seq, uint64_t budget_ns) {
  * executor sets host_idle again before it next sleeps. */
 static inline int
 wmtr_claim_kick(volatile uint32_t *host_idle) {
+  if (__builtin_expect(__atomic_load_n(host_idle, __ATOMIC_RELAXED) == 0, 1)) return 0;
   return __atomic_exchange_n(host_idle, 0, __ATOMIC_SEQ_CST) != 0;
 }
 
