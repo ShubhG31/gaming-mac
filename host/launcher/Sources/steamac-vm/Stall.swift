@@ -55,6 +55,8 @@ final class StallMonitor {
     private var readings: [Reading] = []
     private var nextReading = 0
     private var lastReading: CFTimeInterval = 0
+    private var lastHistoryPublish: CFTimeInterval = 0
+    private var lastSampledCPU: Double = StallMonitor.cpuSeconds()
     private var lastPoll: CFTimeInterval = 0
     private var guestUptimeMs = 0
     // A delayed main-queue timer cannot establish guest silence: queued progress
@@ -177,7 +179,7 @@ final class StallMonitor {
         if active {
             hide(reason: nil, now: now)
             lastActivity = now
-            cpuAtActivity = StallMonitor.cpuSeconds()
+            cpuAtActivity = lastSampledCPU
             return
         }
         countersAvailable = c != nil
@@ -334,8 +336,10 @@ final class StallMonitor {
         } else {
             windowState = "detached"
         }
+        let cpu = Self.cpuSeconds()
+        lastSampledCPU = cpu
         let reading = Reading(at: now, counters: counters, heartbeatAge: heartbeatAge(at: now),
-                              uptimeMs: guestUptimeMs, load: guestLoad, cpu: Self.cpuSeconds(),
+                              uptimeMs: guestUptimeMs, load: guestLoad, cpu: cpu,
                               pollGap: gap, game: gameFocused, gate: gateOpen,
                               hostActive: NSApp.isActive, hostKey: window?.isKeyWindow ?? false,
                               hostWindow: windowState)
@@ -345,7 +349,11 @@ final class StallMonitor {
             readings[nextReading] = reading
         }
         nextReading = (nextReading + 1) % 32
-        CrashReporting.updateGPUHistory(diagnosticHistory(now: now) + "\n" + VMMemoryDiagnostics.shared.history())
+        let stalled = shownSince != nil
+        if stalled || now - lastHistoryPublish >= 5 {
+            lastHistoryPublish = now
+            CrashReporting.updateGPUHistory(diagnosticHistory(now: now) + "\n" + VMMemoryDiagnostics.shared.history(), force: stalled)
+        }
     }
 
     // Unlabelled neighbouring counters can resemble a payment-card number to

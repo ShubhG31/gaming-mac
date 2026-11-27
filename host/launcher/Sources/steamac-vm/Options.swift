@@ -21,7 +21,7 @@ enum MouseMode: String {
 struct Options {
     var kernel: String = ""
     var initrd: String?
-    var cmdline = "console=hvc0 loglevel=4 rootwait"
+    var cmdline = "console=hvc0 loglevel=4 rootwait audit=0"
     var disks: [DiskSpec] = []
     /// --share DIR / Settings > Advanced "Shared folder": a Mac folder exposed to the guest as the
     /// virtio-fs device tagged `Options.shareTag` (VM.init). nil = no share.
@@ -86,7 +86,7 @@ struct Options {
     var guestSize: (Int, Int) {
         WindowController.guestSize(points: CGSize(width: displayWidth, height: displayHeight), scale: pixelScale)
     }
-    var refreshRate = 60
+    var refreshRate = LauncherSettings.defaultRefreshRate()
     var dpi: Int?
     var displayMM: (Int, Int)?
     var selftestOverlay = false
@@ -562,6 +562,9 @@ struct Options {
             // preen cannot fix (a VM killed mid-write, two VMs on one disk) is repaired at boot instead of
             // failing /home and every unit after it (boot stuck at "Starting SteamOS services").
             add("fsck.repair", "yes")
+            if !o.explicit.contains("--shm-mib") {
+                o.shmMiB = max(8192, o.gpuBudgetMiB + 2048)
+            }
         }
         try o.validate()
         return (o, overrides)

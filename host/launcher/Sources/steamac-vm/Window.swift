@@ -613,6 +613,11 @@ final class WindowController: NSObject, NSWindowDelegate {
                 done(drawable, composite)
             }
         }
+        // Temporarily allow drawable readback for this capture only, keeping framebufferOnly=true
+        // during normal rendering so Apple silicon can use hardware framebuffer compression.
+        let wasFramebufferOnly = view.metalLayer.framebufferOnly
+        if wasFramebufferOnly { view.metalLayer.framebufferOnly = false }
+        defer { if wasFramebufferOnly { view.metalLayer.framebufferOnly = true } }
         view.redraw()
     }
 
@@ -954,7 +959,8 @@ extension WindowController {
             hide = view.hitTest(sup.convert(location, from: nil)) === view
         }
         // Last (a WindowServer query): the topmost window under the pointer is this one.
-        if hide {
+        // An active fullscreen key window with no attached sheets is already topmost.
+        if hide && !(window.styleMask.contains(.fullScreen) && NSApp.isActive && window.sheets.isEmpty) {
             hide = NSWindow.windowNumber(at: window.convertPoint(toScreen: location), belowWindowWithWindowNumber: 0) == window.windowNumber
         }
         setHostCursorHidden(hide)
@@ -1063,7 +1069,7 @@ extension WindowController {
     }
 
     func pointerMoved(_ e: NSEvent) {
-        updateHostCursor(e)
+        if !captured { updateHostCursor(e) }
         if pauseView.shown || guestAsleep { return }   // nothing reaches a frozen game / sleeping guest
         if captured {
             moveRelative(dx: Double(e.deltaX), dy: Double(e.deltaY))

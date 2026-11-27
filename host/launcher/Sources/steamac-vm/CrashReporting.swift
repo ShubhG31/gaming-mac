@@ -676,11 +676,19 @@ enum CrashReporting {
 
     // MARK: reports
 
+    private static let gpuHistoryQueue = DispatchQueue(label: "steamac.crash.gpu-history", qos: .utility)
+    private static var lastGPUHistoryWrite: TimeInterval = 0
+
     /// VM process: publish a bounded snapshot for the supervisor's fatal-line reports.
-    /// StallMonitor calls this once per second; no history is persisted when reporting is off.
-    static func updateGPUHistory(_ history: String) {
+    /// Runs scrubbing and atomic disk I/O off the main thread, throttled to every 5 s while healthy.
+    static func updateGPUHistory(_ history: String, force: Bool = false) {
         guard locked({ running }), let dir = Supervisor.runDir else { return }
-        try? String(scrub(history).prefix(8000)).write(toFile: dir + "/gpu-history.txt", atomically: true, encoding: .utf8)
+        let now = ProcessInfo.processInfo.systemUptime
+        if !force && now - lastGPUHistoryWrite < 5 { return }
+        lastGPUHistoryWrite = now
+        gpuHistoryQueue.async {
+            try? String(scrub(history).prefix(8000)).write(toFile: dir + "/gpu-history.txt", atomically: true, encoding: .utf8)
+        }
     }
 
     /// Rate-limited, deduplicated report (no-op when reporting is off). `extra`: long scrubbed

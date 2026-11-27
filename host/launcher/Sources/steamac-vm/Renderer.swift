@@ -12,14 +12,19 @@ final class Renderer {
     private let pipeline: MTLRenderPipelineState
     private let linear: MTLSamplerState
     private let nearest: MTLSamplerState
-    private(set) var texture: MTLTexture?
+    /// Triple-buffered shared textures so CPU uploads never stall waiting for an in-flight GPU draw.
+    private static let ringCount = 3
+    private var textureRing: [MTLTexture] = []
+    private var ringCommandBuffers: [MTLCommandBuffer?] = Array(repeating: nil, count: ringCount)
+    private var ringIndex = 0
+    private var textureRevision: UInt64 = 0
+    var texture: MTLTexture? { textureRing.isEmpty ? nil : textureRing[ringIndex] }
     /// Self-test hook: copy the next presented drawable (requires layer.framebufferOnly = false)
     /// and hand back BGRA bytes + size on a Metal completion thread.
     var captureNextDraw: (([UInt8], Int, Int) -> Void)?
     /// Called once, on the main queue, after a drawable has actually reached the screen.
     var onFirstOnScreen: (() -> Void)?
     private var textureGeneration = -1
-    private var lastCommandBuffer: MTLCommandBuffer?
     static let layerFormat: MTLPixelFormat = .bgra8Unorm
 
     /// MetalFX spatial upscaling of the guest frame to its on-screen pixel size whenever that is
@@ -33,6 +38,7 @@ final class Renderer {
     /// Scaler + its output texture for the current input format/size -> output size.
     private var scaler: MTLFXSpatialScaler?
     private var upscaled: MTLTexture?
+    private var upscaledRevision: UInt64 = 0
     /// Set after a scaler could not be made (logged once); super resolution then stays off.
     private var scalerFailed = false
 
@@ -91,22 +97,35 @@ final class Renderer {
         }
     }
 
-    /// Upload the damaged part of `frame` (everything if the texture is new).
+    /// Upload the damaged part of `frame` (everything if the texture is new or rotated).
     func upload(_ frame: TakenFrame) {
         let b = frame.buffer
         var full = frame.damage == nil
-        if texture == nil || textureGeneration != frame.generation
-            || texture!.width != b.width || texture!.height != b.height {
+        if textureRing.isEmpty || textureGeneration != frame.generation
+            || textureRing[0].width != b.width || textureRing[0].height != b.height {
             let (pf, swizzle) = Renderer.textureLayout(for: b.format)
             let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pf, width: b.width, height: b.height, mipmapped: false)
             td.usage = .shaderRead
             td.storageMode = .shared
             td.swizzle = swizzle
-            texture = device.makeTexture(descriptor: td)
+            textureRing = (0..<Renderer.ringCount).compactMap { _ in device.makeTexture(descriptor: td) }
+            ringCommandBuffers = Array(repeating: nil, count: Renderer.ringCount)
+            ringIndex = 0
             textureGeneration = frame.generation
+            upscaledRevision = 0
             full = true
         }
-        guard let texture else { return }
+        guard !textureRing.isEmpty else { return }
+        // Reuse the current slot in-place when its GPU draw already completed (keeps partial damage fast);
+        // otherwise rotate to the next slot in the ring so the main thread never stalls on the GPU.
+        if let cb = ringCommandBuffers[ringIndex], cb.status != .completed && cb.status != .error {
+            ringIndex = (ringIndex + 1) % textureRing.count
+            if let old = ringCommandBuffers[ringIndex], old.status != .completed && old.status != .error {
+                old.waitUntilCompleted()
+            }
+            full = true
+        }
+        let target = textureRing[ringIndex]
         let rect: DamageRect
         if full {
             rect = DamageRect(x0: 0, y0: 0, x1: b.width, y1: b.height)
@@ -115,24 +134,26 @@ final class Renderer {
         } else {
             return
         }
-        // Don't overwrite texels a previous command buffer may still be sampling.
-        lastCommandBuffer?.waitUntilCompleted()
         let src = b.ptr.advanced(by: rect.y0 * b.stride + rect.x0 * 4)
-        texture.replace(region: MTLRegionMake2D(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0),
-                        mipmapLevel: 0, withBytes: src, bytesPerRow: b.stride)
+        target.replace(region: MTLRegionMake2D(rect.x0, rect.y0, rect.x1 - rect.x0, rect.y1 - rect.y0),
+                       mipmapLevel: 0, withBytes: src, bytesPerRow: b.stride)
+        textureRevision &+= 1
     }
 
-    /// Use the window queue so the next upload waits for every reader of the shared scanout.
+    /// Use the window queue so the current ring slot tracks every reader of the shared scanout.
     func submitCapture(_ encode: (MTLCommandBuffer) -> Void) {
         guard let cb = queue.makeCommandBuffer() else { return }
         encode(cb)
         cb.commit()
-        lastCommandBuffer = cb
+        if !textureRing.isEmpty { ringCommandBuffers[ringIndex] = cb }
     }
 
     func dropTexture() {
-        texture = nil
+        textureRing.removeAll()
+        ringCommandBuffers = Array(repeating: nil, count: Renderer.ringCount)
+        ringIndex = 0
         textureGeneration = -1
+        textureRevision &+= 1
         releaseScaler()
     }
 
@@ -152,6 +173,7 @@ final class Renderer {
     private func releaseScaler() {
         scaler = nil
         upscaled = nil
+        upscaledRevision = 0
     }
 
     /// A scaler (and output texture) from `texture` to `width` x `height`, reused while those match.
@@ -206,15 +228,20 @@ final class Renderer {
             nearestSampling = sx >= 1 && abs(sx - sx.rounded()) < 0.001 && abs(sy - sx) < 0.001
             if superResolution, sx > 1, sy > 1,
                case let (s, out)? = scaler(for: texture, width: Int(vp.width), height: Int(vp.height)) {
-                s.colorTexture = texture   // a new frame texture of the same size reuses the scaler
-                s.encode(commandBuffer: cb)
+                if upscaledRevision != textureRevision {
+                    s.colorTexture = texture   // a new frame texture of the same size reuses the scaler
+                    s.encode(commandBuffer: cb)
+                    upscaledRevision = textureRevision
+                }
                 source = out
                 nearestSampling = true
             }
         }
         let rp = MTLRenderPassDescriptor()
         rp.colorAttachments[0].texture = target
-        rp.colorAttachments[0].loadAction = .clear
+        let fullCoverage = source != nil && vp.originX == 0 && vp.originY == 0
+            && Int(vp.width) == target.width && Int(vp.height) == target.height
+        rp.colorAttachments[0].loadAction = fullCoverage ? .dontCare : .clear
         rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         rp.colorAttachments[0].storeAction = .store
         guard let enc = cb.makeRenderCommandEncoder(descriptor: rp) else { return }
@@ -267,7 +294,7 @@ final class Renderer {
         }
         cb.present(drawable)
         cb.commit()
-        lastCommandBuffer = cb
+        if !textureRing.isEmpty { ringCommandBuffers[ringIndex] = cb }
     }
 
     /// Render exactly like `draw(to:)` into an offscreen BGRA texture and read it back

@@ -57,14 +57,14 @@ enum VMSizing {
         return min(maxAutoMemMiB, max(minAutoMemMiB, rounded))
     }
 
-    /// One vCPU per performance core, 2...8: M1 / M2 / M3 / M4 (4 P) → 4, Pro chips → 6-8, Max → 8.
-    /// The vCPU threads run at user-interactive QoS (libkrun patch 0013), so macOS keeps them on
-    /// P-cores; more vCPUs than P-cores puts guest threads on efficiency cores (a fraction of the
-    /// speed), where a lock holder or a FEX JIT thread stalls the vCPUs waiting for it. Past 8,
-    /// Steam, Proton and FEX gain little, while the host's own frame-path threads (virglrenderer
-    /// rings, MoltenVK pipeline compiles, the renderer) need cores too.
+    /// One vCPU per performance core, reserving 1 P-core for host Metal/wmtr/virglrenderer
+    /// threads whenever the Mac has 6 or more P-cores: M1/M2/M3/M4 (4 P) → 4, 6P Pro → 5,
+    /// 8P Pro → 7, 10P/12P Max → 8. The vCPU threads run at user-interactive QoS (libkrun patch
+    /// 0013), so leaving 1 P-core unallocated avoids guest vCPUs preempting the host GPU frame
+    /// path, while keeping every vCPU off efficiency cores.
     static func autoCPUs(_ host: Host) -> Int {
-        min(maxAutoCPUs, max(2, min(minAutoCPUs, host.cores), host.fastCores))
+        let budget = host.fastCores >= 6 ? host.fastCores - 1 : host.fastCores
+        return min(maxAutoCPUs, max(2, min(minAutoCPUs, host.cores), budget))
     }
 
     /// Settings > Advanced: why a custom memory size is risky on this Mac, or nil.
@@ -102,10 +102,10 @@ enum VMSizing {
         for (gb, want) in mem where autoMemMiB(host(gb, 4, 8)) != want {
             failures.append("sizing: \(gb) GB → \(autoMemMiB(host(gb, 4, 8))) MiB, want \(want)")
         }
-        // (P, all cores, want): M1 4+4, M4 4+6, M2 Pro 6+4, M1 Pro 8+2, M3 Max 12+4 (14-core: 10+4), 1 P,
-        // 2 fast of 12 (STEAMAC-2K), 2 cores, no perflevel sysctl.
-        let cpus: [(Int?, Int, Int)] = [(4, 8, 4), (4, 10, 4), (6, 10, 6), (8, 10, 8), (12, 16, 8), (10, 14, 8), (1, 4, 4),
-                                        (2, 12, 4), (1, 2, 2), (nil, 8, 8), (nil, 1, 2)]
+        // (P, all cores, want): M1 4+4, M4 4+6, M2 Pro 6+4 (1P host reserve -> 5), M1/M2 Pro 8+2/4 (1P host reserve -> 7),
+        // M3 Max 12+4 (14-core: 10+4), 1 P, 2 fast of 12 (STEAMAC-2K), 2 cores, no perflevel sysctl.
+        let cpus: [(Int?, Int, Int)] = [(4, 8, 4), (4, 10, 4), (6, 10, 5), (8, 10, 7), (12, 16, 8), (10, 14, 8), (1, 4, 4),
+                                        (2, 12, 4), (1, 2, 2), (nil, 8, 7), (nil, 1, 2)]
         for (p, n, want) in cpus where autoCPUs(host(16, p, n)) != want {
             failures.append("sizing: \(p.map(String.init) ?? "-")P/\(n) cores → \(autoCPUs(host(16, p, n))) vCPUs, want \(want)")
         }

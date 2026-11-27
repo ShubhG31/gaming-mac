@@ -182,6 +182,15 @@ final class Scanout {
         }
     }
 
+    /// Re-take the last presented frame with full damage (used when an occluded DXMT layer hides).
+    func takeLastPresented() -> TakenFrame? {
+        locked {
+            guard let i = lastPresented else { return nil }
+            displaying = i
+            return TakenFrame(buffer: buffers[i], damage: nil, generation: generation)
+        }
+    }
+
     /// Copy of the most recently presented frame (safe: the GPU thread never writes into it).
     func snapshot() -> (data: Data, width: Int, height: Int, format: UInt32)? {
         locked {
@@ -210,11 +219,14 @@ final class Scanout {
     /// Scanout state, plus the darkness of the latest frame if one newer than `seen` (a
     /// `presented` value) arrived. The GPU thread never writes into the last presented frame.
     func probe(sampleIfNewerThan seen: UInt64) -> Probe {
-        locked {
-            var p = Probe(enabled: enabled, hasPicture: lastPresented != nil, presented: presented, dark: nil)
-            if let i = lastPresented, presented != seen { p.dark = Scanout.darkFraction(buffers[i]) }
-            return p
+        let (p, buf): (Probe, FrameBuffer?) = locked {
+            let probe = Probe(enabled: enabled, hasPicture: lastPresented != nil, presented: presented, dark: nil)
+            let b = (lastPresented != nil && presented != seen) ? buffers[lastPresented!] : nil
+            return (probe, b)
         }
+        var out = p
+        if let buf { out.dark = Scanout.darkFraction(buf) }
+        return out
     }
 
     /// Sparse black test: luma at a `sampleColumns`×`sampleRows` grid of pixel centres (2560 reads,

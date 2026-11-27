@@ -311,6 +311,7 @@ final class NoPictureGuard {
 
     private let probe: (UInt64) -> Scanout.Probe
     private var timer: DispatchSourceTimer?
+    private var started = false
     /// `presented` of the last sampled frame (`.max`: sample the current one).
     private var seen = UInt64.max
     /// Darkness of the latest sampled frame of the current picture.
@@ -346,12 +347,22 @@ final class NoPictureGuard {
     private var gateOpen: Bool { ready && !gameFocused && !gamePaused && !asleep && !vmPaused }
 
     func start() {
-        guard timer == nil else { return }
-        let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now() + NoPictureGuard.tick, repeating: NoPictureGuard.tick, leeway: .milliseconds(20))
-        t.setEventHandler { [weak self] in self?.poll() }
-        t.resume()
-        timer = t
+        started = true
+        updateTimer()
+    }
+
+    private func updateTimer() {
+        if started && gateOpen {
+            guard timer == nil else { return }
+            let t = DispatchSource.makeTimerSource(queue: .main)
+            t.schedule(deadline: .now() + NoPictureGuard.tick, repeating: NoPictureGuard.tick, leeway: .milliseconds(20))
+            t.setEventHandler { [weak self] in self?.poll() }
+            t.resume()
+            timer = t
+        } else {
+            timer?.cancel()
+            timer = nil
+        }
     }
 
     /// Guest heartbeat (`alive <uptime_ms> <loadavg1>`).
@@ -368,6 +379,7 @@ final class NoPictureGuard {
         seen = .max
         cpuSamples.removeAll()
         if !gateOpen { hide(closedBy) }
+        updateTimer()
     }
 
     private func poll() {
@@ -394,7 +406,7 @@ final class NoPictureGuard {
                 }
             }
         }
-        noteCPU(now)
+        if missingSince != nil || darkSince != nil || shownSince != nil { noteCPU(now) }
         let reason = missing ? (p.enabled ? "no frame" : "display off") : "black picture"
         if shownSince == nil {
             let due = missing ? now - (missingSince ?? now) >= NoPictureGuard.missingThreshold

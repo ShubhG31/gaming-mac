@@ -336,7 +336,18 @@ final class LauncherSettings: ObservableObject {
     @Published var fixedDPI = 110 { didSet { save(.fixedDPI, fixedDPI) } }
     @Published var fixedWidthMM = 300 { didSet { save(.fixedWidthMM, fixedWidthMM) } }
     @Published var fixedHeightMM = 188 { didSet { save(.fixedHeightMM, fixedHeightMM) } }
-    @Published var refreshRate = 60 { didSet { save(.refreshRate, refreshRate) } }
+    static let supportedRefreshRates = [30, 48, 50, 60, 72, 75, 90, 100, 120, 144]
+
+    /// Match the host screen's maximum refresh rate (e.g. 120 Hz on ProMotion panels), clamped to
+    /// the supported EDID refresh rates; falls back to 60 Hz when headless or unavailable.
+    static func defaultRefreshRate() -> Int {
+        guard Thread.isMainThread,
+              let fps = (WindowController.targetScreen() ?? NSScreen.main)?.maximumFramesPerSecond,
+              fps > 0 else { return 60 }
+        return supportedRefreshRates.last(where: { $0 <= fps }) ?? 60
+    }
+
+    @Published var refreshRate = LauncherSettings.defaultRefreshRate() { didSet { save(.refreshRate, refreshRate) } }
     @Published var followWindowSize = true { didSet { save(.followWindowSize, followWindowSize) } }
     @Published var windowWidth = 1280 { didSet { save(.windowWidth, windowWidth) } }
     @Published var windowHeight = 800 { didSet { save(.windowHeight, windowHeight) } }

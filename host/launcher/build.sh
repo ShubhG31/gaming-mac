@@ -58,6 +58,7 @@ SWIFT_FLAGS=(
     -Xlinker -rpath -Xlinker @executable_path/Frameworks
     -Xlinker -rpath -Xlinker "$KRUN_PREFIX/lib"
     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$PLIST"
+    -Xswiftc -cross-module-optimization
     -Xswiftc -emit-localized-strings -Xswiftc -emit-localized-strings-path -Xswiftc "$HERE/.build/stringsdata"
 )
 

@@ -24,7 +24,7 @@ struct GameProfile: Codable, Equatable {
         env = try c.decodeIfPresent(String.self, forKey: .env) ?? ""
     }
 
-    private static let word = try! NSRegularExpression(pattern: "^(VKD3D|DXVK|PROTON|WINE|MESA|RADV|VK|DXMT|MTL|STEAMAC)_[A-Z0-9_]*=[A-Za-z0-9_.,:;+-]*$")
+    private static let word = try! NSRegularExpression(pattern: "^((VKD3D|DXVK|PROTON|WINE|MESA|RADV|VK|DXMT|MTL|STEAMAC)_[A-Z0-9_]*|FEX_(X87REDUCEDPRECISION|MULTIBLOCK|HALFBARRIERTSOENABLED|VOLATILEMETADATA|TSOENABLED|VECTORTSOENABLED))=[A-Za-z0-9_.,:;+-]*$")
     static func validWord(_ text: String) -> Bool {
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return word.firstMatch(in: text, range: range)?.range == range
@@ -58,10 +58,10 @@ struct GameProfile: Codable, Equatable {
     static func selfCheck() -> [String] {
         var failures: [String] = []
         if sanitizedEnv("DXVK_A=1 PROTON_B=2 DXVK_A=3 BAD=secret WINE_X=$(id)") != "DXVK_A=3 PROTON_B=2" { failures.append("profiles: env canonicalization") }
-        for value in ["PATH=/tmp", "DXVK_A=$(id)", "DXVK_A=1\nWINE_B=2", String(repeating: "A", count: 257)] {
+        for value in ["PATH=/tmp", "DXVK_A=$(id)", "DXVK_A=1\nWINE_B=2", "FEX_ROOTFS=foo", "FEX_OUTPUTLOG=bar", String(repeating: "A", count: 257)] {
             if validEnv(value) { failures.append("profiles: accepted invalid env") }
         }
-        if !validEnv("VKD3D_CONFIG=dxr;dxr11 MTL_HUD_ENABLED=1") || !validEnv("") { failures.append("profiles: valid env rejected") }
+        if !validEnv("VKD3D_CONFIG=dxr;dxr11 MTL_HUD_ENABLED=1 FEX_X87REDUCEDPRECISION=1") || !validEnv("") { failures.append("profiles: valid env rejected") }
         let data = Data(#"{"recommended":{"driver":"moltenvk","gfx":"vulkan","env":null,"installs":2,"sessions":3,"ratings":{"well":2,"issues":0,"unplayable":0,"no_start":0},"fps_avg_median":29,"launch_rate":1}}"#.utf8)
         if (try? JSONDecoder().decode(GameRecommendation.Response.self, from: data).recommended?.profile) != GameProfile(gfx: "vulkan", driver: "moltenvk") { failures.append("profiles: recommendation decoding") }
         let progress = BootProgress()

@@ -21,6 +21,7 @@ import Synchronization
 /// Intervals over 25 ms (more than 1.5 frames at 60 Hz) and 50 ms are the visible stutters.
 final class PerfStats {
     static let instance = PerfStats()
+    static let didChangeNotification = Notification.Name("steamac.perfStatsDidChange")
     private static let enabled = Atomic<Bool>(false)
     /// The collector while stats are on (hot paths: one relaxed atomic load when off).
     static var shared: PerfStats? { enabled.load(ordering: .relaxed) ? instance : nil }
@@ -66,6 +67,7 @@ final class PerfStats {
         }
         enabled.store(on, ordering: .relaxed)
         if on { instance.start() } else { instance.stop() }
+        NotificationCenter.default.post(name: didChangeNotification, object: nil)
     }
 
     private func start() {

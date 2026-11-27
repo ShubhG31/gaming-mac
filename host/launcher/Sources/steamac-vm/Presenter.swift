@@ -61,6 +61,13 @@ final class Presenter: DisplaySink {
         pending = false
         os_unfair_lock_unlock(&lock)
         guard let f = scanout.take() else { return }
+        // While an opaque DXMT game layer completely covers the scanout layer (and nobody needs
+        // stream capture or a first-frame/one-shot callback), skip Metal texture upload & redraw.
+        if let view, view.scanoutOccluded, onNextFrame == nil, renderer.onFirstOnScreen == nil {
+            scanout.release(f)
+            framesShown &+= 1
+            return
+        }
         let perf = PerfStats.shared
         let flushedAt = perf?.frameTaken() ?? 0
         let t0 = perf != nil ? CACurrentMediaTime() : 0
@@ -75,6 +82,16 @@ final class Presenter: DisplaySink {
             next()
         }
     }
+
+    /// Upload and redraw the latest scanout frame immediately when an occluding DXMT layer hides
+    /// or stream capture starts so Steam UI / Desktop reappears without stale pixels.
+    func reveal() {
+        guard let f = scanout.takeLastPresented() else { return }
+        renderer.upload(f)
+        onStreamFrame?()
+        scanout.release(f)
+        view?.redraw()
+    }
 }
 
 /// NSView backed by a CAMetalLayer showing the guest scanout, aspect-fit and Retina-aware.
@@ -85,9 +102,23 @@ final class VMView: NSView {
     /// Hidden on the Vulkan path and while the game hides its cursor.
     private let cursorLayer = CALayer()
     var onStreamChange: (() -> Void)?
+    /// Called when the guest scanout becomes visible again after being occluded by a DXMT game layer.
+    var onScanoutRevealed: (() -> Void)?
+    private var wasScanoutOccluded = false
+    /// True when an opaque DXMT game layer covers the guest scanout and stream capture is inactive.
+    var scanoutOccluded: Bool { gameLayersVisible && activeGameLayer != nil && !streamCaptureActive }
     private var streamLayerPolicies: [CAMetalLayer: Bool] = [:]
     @objc dynamic var streamCaptureActive = false {
-        didSet { updateStreamLayers() }
+        didSet {
+            updateStreamLayers()
+            updateScanoutOcclusion()
+        }
+    }
+
+    private func updateScanoutOcclusion() {
+        let occluded = scanoutOccluded
+        if wasScanoutOccluded && !occluded { onScanoutRevealed?() }
+        wasScanoutOccluded = occluded
     }
 
     private func updateStreamLayers() {
@@ -241,7 +272,20 @@ final class VMView: NSView {
                        name: NSWindow.didChangeScreenNotification, object: window)
         nc.addObserver(self, selector: #selector(displayConfigurationChanged(_:)),
                        name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        nc.addObserver(self, selector: #selector(perfStatsChanged(_:)),
+                       name: PerfStats.didChangeNotification, object: nil)
         logDisplayConfiguration(reason: "window attached")
+        updateDisplayDiagnosticTimer()
+    }
+
+    @objc private func perfStatsChanged(_ notification: Notification) {
+        updateDisplayDiagnosticTimer()
+    }
+
+    private func updateDisplayDiagnosticTimer() {
+        displayDiagnosticTimer?.invalidate()
+        displayDiagnosticTimer = nil
+        guard window != nil, PerfStats.shared != nil else { return }
         // DXMT's game layer bypasses Renderer. Sample its actual policy, not the main
         // scanout layer's policy, so a report can distinguish unsynced presents from
         // a mismatched host mode. This does not drive rendering or change its cadence.
@@ -427,6 +471,7 @@ final class VMView: NSView {
             }
             controller?.refreshHostCursor()
             updateCursorLayer()
+            updateScanoutOcclusion()
             if oldValue != gameLayersVisible { onStreamChange?() }
         }
     }

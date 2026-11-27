@@ -38,6 +38,8 @@ MetalCompilerCache.prepare()
 // MoltenVK (loaded by virglrenderer in this process) logs every instance/device creation at info
 // level, which buries the guest console. Errors only, unless the user asks for more.
 setenv("MVK_CONFIG_LOG_LEVEL", "1", 0)
+// Let Metal use all available cores for concurrent shader/pipeline compilation unless overridden.
+setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0)
 
 // Crash reporting (Settings > General; both the supervisor and each VM process).
 CrashReporting.setUp(options: options, settings: settings)
@@ -468,8 +470,8 @@ do {
                               pixelScale: options.pixelScale, renderer: renderer, inputs: inputs, mouseMode: options.mouseMode)
     if let f = Supervisor.windowFrame, !f.isEmpty { wc.window.setFrame(NSRectFromString(f), display: false) }
     presenter.view = wc.view
+    wc.view.onScanoutRevealed = { [weak presenter] in presenter?.reveal() }
     PerfStats.instance.attach(view: wc.view)
-    wc.view.metalLayer.framebufferOnly = false   // SIGUSR1 can read back the presented drawable
     windowController = wc
     presenter.onScanoutResize = { [weak wc] w, h in wc?.scanoutResized(width: w, height: h) }
     display.sink = presenter
