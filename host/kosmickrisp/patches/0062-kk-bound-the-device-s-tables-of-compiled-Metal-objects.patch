@@ -213,7 +213,7 @@ index 6719982..d7b3e7e 100644
 +/* Entries per table. Dragon's Dogma 2 compiles ~4,600 distinct programs in a
 + * run (two libraries each at most); past this the oldest are compiled again
 + * when asked for. MESA_KK_METAL_CACHE_MAX overrides it. */
-+#define KK_METAL_CACHE_MAX 4096u
++#define KK_METAL_CACHE_MAX 16384u
 +
 +static bool
 +kk_metal_cache_init(struct kk_metal_cache *c, uint32_t (*hash)(const void *),

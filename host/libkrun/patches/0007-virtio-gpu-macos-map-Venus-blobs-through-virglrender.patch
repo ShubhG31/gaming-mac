@@ -137,7 +137,7 @@ index 593263e..1df37c8 100644
          self.rutabaga.unref_resource(resource_id)?;
          Ok(OkNoData)
      }
-@@ -917,6 +963,104 @@ impl VirtioGpu {
+@@ -917,6 +963,122 @@ impl VirtioGpu {
              map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
          })
      }
@@ -191,45 +191,63 @@ index 593263e..1df37c8 100644
 +            error!("resource {resource_id}: blob fd is empty");
 +            return Err(ErrUnspec);
 +        }
-+        if file_len < len {
++        let addr = if file_len == len {
++            // Fast path: full-sized shm fd maps in one mmap syscall.
++            // SAFETY: a fresh mapping of `fd`; no existing memory is touched.
++            let addr = unsafe {
++                libc::mmap(
++                    std::ptr::null_mut(),
++                    len as usize,
++                    libc::PROT_READ | libc::PROT_WRITE,
++                    libc::MAP_SHARED,
++                    fd,
++                    0,
++                )
++            };
++            if addr == libc::MAP_FAILED {
++                error!("resource {resource_id}: cannot map the blob fd");
++                return Err(ErrUnspec);
++            }
++            addr
++        } else {
 +            warn!(
 +                "resource {resource_id}: blob fd holds {file_len} bytes, resource is {}",
 +                resource.size
 +            );
-+        }
-+
-+        // SAFETY: a fresh anonymous mapping; no existing memory is touched.
-+        let addr = unsafe {
-+            libc::mmap(
-+                std::ptr::null_mut(),
-+                len as usize,
-+                libc::PROT_READ | libc::PROT_WRITE,
-+                libc::MAP_ANON | libc::MAP_PRIVATE,
-+                -1,
-+                0,
-+            )
++            // SAFETY: a fresh anonymous mapping; no existing memory is touched.
++            let addr = unsafe {
++                libc::mmap(
++                    std::ptr::null_mut(),
++                    len as usize,
++                    libc::PROT_READ | libc::PROT_WRITE,
++                    libc::MAP_ANON | libc::MAP_PRIVATE,
++                    -1,
++                    0,
++                )
++            };
++            if addr == libc::MAP_FAILED {
++                error!("resource {resource_id}: cannot reserve {len} bytes");
++                return Err(ErrUnspec);
++            }
++            // SAFETY: replaces the start of the reservation made just above.
++            let ret = unsafe {
++                libc::mmap(
++                    addr,
++                    file_len as usize,
++                    libc::PROT_READ | libc::PROT_WRITE,
++                    libc::MAP_SHARED | libc::MAP_FIXED,
++                    fd,
++                    0,
++                )
++            };
++            if ret == libc::MAP_FAILED {
++                error!("resource {resource_id}: cannot map the blob fd");
++                // SAFETY: the reservation made above, unused.
++                unsafe { libc::munmap(addr, len as usize) };
++                return Err(ErrUnspec);
++            }
++            addr
 +        };
-+        if addr == libc::MAP_FAILED {
-+            error!("resource {resource_id}: cannot reserve {len} bytes");
-+            return Err(ErrUnspec);
-+        }
-+        // SAFETY: replaces the start of the reservation made just above.
-+        let ret = unsafe {
-+            libc::mmap(
-+                addr,
-+                file_len as usize,
-+                libc::PROT_READ | libc::PROT_WRITE,
-+                libc::MAP_SHARED | libc::MAP_FIXED,
-+                fd,
-+                0,
-+            )
-+        };
-+        if ret == libc::MAP_FAILED {
-+            error!("resource {resource_id}: cannot map the blob fd");
-+            // SAFETY: the reservation made above, unused.
-+            unsafe { libc::munmap(addr, len as usize) };
-+            return Err(ErrUnspec);
-+        }
 +
 +        let mapping = HostMapping {
 +            addr: addr as u64,
@@ -242,7 +260,7 @@ index 593263e..1df37c8 100644
      #[cfg(target_os = "macos")]
      pub fn resource_map_blob(
          &mut self,
-@@ -924,44 +1068,47 @@ impl VirtioGpu {
+@@ -924,44 +1086,47 @@ impl VirtioGpu {
          shm_region: &VirtioShmRegion,
          offset: u64,
      ) -> VirtioGpuResult {

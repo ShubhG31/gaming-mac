@@ -34,8 +34,18 @@ error)").
 ---
 --- a/src/venus/vkr_common.h
 +++ b/src/venus/vkr_common.h
-@@ -51,6 +51,14 @@
-    atomic_fetch_add_explicit(&vkr_dispatch_count, 1, memory_order_relaxed);
+@@ -51,6 +51,23 @@
+-   atomic_fetch_add_explicit(&vkr_dispatch_count, 1, memory_order_relaxed);
++   /* Batch relaxed increments per thread to avoid cross-ring cache-line bouncing,
++    * while publishing the first command immediately so blocking commands still show up. */
++   static _Thread_local uint32_t local_pending;
++   if (unlikely(++local_pending == 1u)) {
++      atomic_fetch_add_explicit(&vkr_dispatch_count, 1, memory_order_relaxed);
++   } else if (unlikely(local_pending >= 64u)) {
++      atomic_fetch_add_explicit(&vkr_dispatch_count, local_pending - 1u,
++                                memory_order_relaxed);
++      local_pending = 0u;
++   }
  }
  
 +/* steamac: whether this thread made the context fatal during the command it is
@@ -273,7 +283,8 @@ error)").
 @@ -21,6 +21,7 @@
  struct vkr_renderer_state vkr_state;
  
- atomic_uint_fast64_t vkr_dispatch_count;
+-atomic_uint_fast64_t vkr_dispatch_count;
++_Alignas(128) atomic_uint_fast64_t vkr_dispatch_count;
 +_Thread_local bool vkr_fatal_raised_here;
  
  VIRGL_EXPORT uint64_t

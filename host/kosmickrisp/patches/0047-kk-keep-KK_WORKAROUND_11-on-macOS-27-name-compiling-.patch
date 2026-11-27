@@ -88,7 +88,7 @@ diff --git a/src/kosmickrisp/bridge/mtl_compiler.m b/src/kosmickrisp/bridge/mtl_
 index f0f6a61..64b7eed 100644
 --- a/src/kosmickrisp/bridge/mtl_compiler.m
 +++ b/src/kosmickrisp/bridge/mtl_compiler.m
-@@ -13,6 +13,159 @@
+@@ -13,6 +13,166 @@
  #include <Metal/MTL4RenderPipeline.h>
  #include <Metal/MTLDevice.h>
  
@@ -179,19 +179,25 @@ index f0f6a61..64b7eed 100644
 +         break;
 +      }
 +   }
-+   for (uint32_t i = 0u; i < MTL_COMPILES_TRACKED; i++) {
-+      if (!mtl_compiles[i].used)
-+         continue;
-+      bool seen = false;
-+      for (uint32_t j = 0u; j < i && !seen; j++)
-+         seen = mtl_compiles[j].used && mtl_compiles[j].compiler == mtl_compiles[i].compiler;
-+      c->compilers += !seen;
++   if (c->in_flight == 1u) {
++      c->compilers = 1u;
++   } else {
++      for (uint32_t i = 0u; i < MTL_COMPILES_TRACKED; i++) {
++         if (!mtl_compiles[i].used)
++            continue;
++         bool seen = false;
++         for (uint32_t j = 0u; j < i && !seen; j++)
++            seen = mtl_compiles[j].used && mtl_compiles[j].compiler == mtl_compiles[i].compiler;
++         c->compilers += !seen;
++      }
 +   }
-+   for (uint32_t i = 0u; i < MTL_COMPILES_TRACKED; i++) {
-+      if (!mtl_compiles[i].used)
-+         continue;
-+      mtl_compiles[i].peak_in_flight = MAX2(mtl_compiles[i].peak_in_flight, c->in_flight);
-+      mtl_compiles[i].peak_compilers = MAX2(mtl_compiles[i].peak_compilers, c->compilers);
++   if (mtl_compiles_logged) {
++      for (uint32_t i = 0u; i < MTL_COMPILES_TRACKED; i++) {
++         if (!mtl_compiles[i].used)
++            continue;
++         mtl_compiles[i].peak_in_flight = MAX2(mtl_compiles[i].peak_in_flight, c->in_flight);
++         mtl_compiles[i].peak_compilers = MAX2(mtl_compiles[i].peak_compilers, c->compilers);
++      }
 +   }
 +   c->compiler = mtl_compiler_serial(compiler);
 +   os_unfair_lock_unlock(&mtl_compiles_lock);
@@ -207,18 +213,16 @@ index f0f6a61..64b7eed 100644
 +      c->thread_name[0] = '\0';
 +   pthread_setname_np(name);
 +
-+   struct timespec ts;
-+   clock_gettime(CLOCK_MONOTONIC, &ts);
-+   c->start_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++   if (mtl_compiles_logged) {
++      struct timespec ts;
++      clock_gettime(CLOCK_MONOTONIC, &ts);
++      c->start_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++   }
 +}
 +
 +static void
 +mtl_compile_end(struct mtl_compile *c, bool ok)
 +{
-+   struct timespec ts;
-+   clock_gettime(CLOCK_MONOTONIC, &ts);
-+   uint64_t end_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-+
 +   uint32_t peak_in_flight = c->in_flight, peak_compilers = c->compilers;
 +   os_unfair_lock_lock(&mtl_compiles_lock);
 +   mtl_compiles_in_flight--;
@@ -232,6 +236,9 @@ index f0f6a61..64b7eed 100644
 +
 +   if (!mtl_compiles_logged)
 +      return;
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   uint64_t end_ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 +   char msl[32] = "";
 +   for (unsigned i = 0u, n = 0u; i < c->msl_count; i++)
 +      n += snprintf(msl + n, sizeof(msl) - n, "%s%08x", i ? "+" : " ", c->msl[i]);
@@ -248,7 +255,7 @@ index f0f6a61..64b7eed 100644
  /* Compiler */
  mtl_compiler *
  mtl_new_compiler(mtl_device *device)
-@@ -27,6 +180,19 @@
+@@ -27,6 +187,19 @@
  
        if (compiler == nil) {
           fprintf(stderr, "Failed to create MTL4Compiler: %s\n", [error.localizedDescription UTF8String]);
@@ -268,7 +275,7 @@ index f0f6a61..64b7eed 100644
        }
  
        return compiler;
-@@ -53,8 +219,13 @@
+@@ -53,8 +226,13 @@
        desc.source = ns_src;
        desc.options = opts;
  
@@ -282,7 +289,7 @@ index f0f6a61..64b7eed 100644
  
        if (lib == nil) {
           fprintf(stderr, "Failed to create MTLLibrary: %s\n", [error.localizedDescription UTF8String]);
-@@ -91,9 +262,12 @@
+@@ -91,9 +269,12 @@
        desc.computeFunctionDescriptor = (MTL4FunctionDescriptor *)function;
        desc.maxTotalThreadsPerThreadgroup = max_total_threads_per_threadgroup;
  
@@ -295,7 +302,7 @@ index f0f6a61..64b7eed 100644
  
        if (pipeline == nil) {
           fprintf(stderr, "Failed to create MTLComputePipelineState: %s\n", [error.localizedDescription UTF8String]);
-@@ -191,9 +365,12 @@
+@@ -191,9 +372,12 @@
        id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
        MTL4RenderPipelineDescriptor *desc = (MTL4RenderPipelineDescriptor *)descriptor;
  

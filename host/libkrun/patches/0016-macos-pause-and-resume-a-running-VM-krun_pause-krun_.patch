@@ -474,13 +474,18 @@ index 893e086..6cd0160 100644
  use utils::eventfd::EventFd;
  use vm_memory::{
      Address, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion,
-@@ -172,6 +173,161 @@ pub struct VcpuConfig {
+@@ -172,6 +173,167 @@ pub struct VcpuConfig {
      pub cpu_template: Option<CpuFeaturesTemplate>,
  }
  
 +extern "C" {
 +    fn mach_absolute_time() -> u64;
 +}
++
++/// Pads a field onto its own Apple Silicon (128-byte) cache line so frequent writes from
++/// WFE enter/leave do not invalidate read-mostly fields on other vCPU cores.
++#[repr(align(128))]
++struct CachePadded<T>(T);
 +
 +/// Pause and resume of a running guest (krun_pause / krun_resume).
 +///
@@ -499,7 +504,8 @@ index 893e086..6cd0160 100644
 +    /// before entering the guest (also vCPUs that were blocked in WFE/boot, not parked).
 +    generation: AtomicU64,
 +    /// vCPUs outside the guest without being parked: waiting for CPU_ON or in a WFE wait.
-+    idle: AtomicUsize,
++    /// Kept on its own 128-byte cache line away from read-mostly `paused` and `generation`.
++    idle: CachePadded<AtomicUsize>,
 +    state: Mutex<PauseState>,
 +    cond: Condvar,
 +    /// HVF ids of the started vCPUs (hv_vcpus_exit targets).
@@ -528,7 +534,7 @@ index 893e086..6cd0160 100644
 +            vcpu_count,
 +            paused: AtomicBool::new(false),
 +            generation: AtomicU64::new(0),
-+            idle: AtomicUsize::new(0),
++            idle: CachePadded(AtomicUsize::new(0)),
 +            state: Mutex::new(PauseState::default()),
 +            cond: Condvar::new(),
 +            vcpus: Mutex::new(Vec::with_capacity(vcpu_count)),
@@ -554,12 +560,12 @@ index 893e086..6cd0160 100644
 +        }
 +        let deadline = Instant::now() + Self::STOP_TIMEOUT;
 +        let mut st = self.state.lock().unwrap();
-+        while st.parked + self.idle.load(Ordering::SeqCst) < self.vcpu_count {
++        while st.parked + self.idle.0.load(Ordering::SeqCst) < self.vcpu_count {
 +            let now = Instant::now();
 +            if now >= deadline {
 +                warn!(
 +                    "pause: {} of {} vCPUs still running after {:?}",
-+                    self.vcpu_count - st.parked - self.idle.load(Ordering::SeqCst),
++                    self.vcpu_count - st.parked - self.idle.0.load(Ordering::SeqCst),
 +                    self.vcpu_count,
 +                    Self::STOP_TIMEOUT
 +                );
@@ -584,16 +590,16 @@ index 893e086..6cd0160 100644
 +            // SAFETY: plain counter read.
 +            let now = unsafe { mach_absolute_time() };
 +            st.hidden_ticks += now.saturating_sub(st.since);
-+            self.generation.fetch_add(1, Ordering::SeqCst);
++            self.generation.fetch_add(1, Ordering::Release);
 +        }
 +        st.paused = false;
-+        self.paused.store(false, Ordering::SeqCst);
++        self.paused.store(false, Ordering::Release);
 +        self.cond.notify_all();
 +        true
 +    }
 +
 +    pub fn is_paused(&self) -> bool {
-+        self.paused.load(Ordering::SeqCst)
++        self.paused.load(Ordering::Acquire)
 +    }
 +
 +    fn register(&self, hvf_vcpuid: u64) {
@@ -601,17 +607,17 @@ index 893e086..6cd0160 100644
 +    }
 +
 +    fn enter_idle(&self) {
-+        self.idle.fetch_add(1, Ordering::SeqCst);
++        self.idle.0.fetch_add(1, Ordering::SeqCst);
 +    }
 +
 +    fn leave_idle(&self) {
-+        self.idle.fetch_sub(1, Ordering::SeqCst);
++        self.idle.0.fetch_sub(1, Ordering::SeqCst);
 +    }
 +
 +    /// Called by a vCPU thread before it enters the guest: parks while paused, then makes
 +    /// sure the vCPU's virtual counter offset hides every paused interval so far.
 +    fn before_run(&self, hvf_vcpu: &mut HvfVcpu, base_offset: u64, applied_generation: &mut u64) {
-+        if self.paused.load(Ordering::SeqCst) {
++        if self.paused.load(Ordering::Acquire) {
 +            let mut st = self.state.lock().unwrap();
 +            if st.paused {
 +                st.parked += 1;
@@ -622,7 +628,7 @@ index 893e086..6cd0160 100644
 +                st.parked -= 1;
 +            }
 +        }
-+        let generation = self.generation.load(Ordering::SeqCst);
++        let generation = self.generation.load(Ordering::Acquire);
 +        if generation != *applied_generation {
 +            let hidden = self.state.lock().unwrap().hidden_ticks;
 +            if let Err(e) = hvf_vcpu.set_vtimer_offset(base_offset.wrapping_add(hidden)) {
@@ -636,7 +642,7 @@ index 893e086..6cd0160 100644
  // Using this for easier explicit type-casting to help IDEs interpret the code.
  type VcpuCell = Cell<Option<*const Vcpu>>;
  
-@@ -201,6 +357,7 @@ pub struct Vcpu {
+@@ -201,6 +363,7 @@ pub struct Vcpu {
  
      vcpu_list: Arc<VcpuList>,
      nested_enabled: bool,
@@ -644,7 +650,7 @@ index 893e086..6cd0160 100644
  }
  
  impl Vcpu {
-@@ -276,6 +433,7 @@ impl Vcpu {
+@@ -276,6 +439,7 @@ impl Vcpu {
          exit_evt: EventFd,
          vcpu_list: Arc<VcpuList>,
          nested_enabled: bool,
@@ -652,7 +658,7 @@ index 893e086..6cd0160 100644
      ) -> Result<Self> {
          let (event_sender, event_receiver) = unbounded();
          let (response_sender, response_receiver) = unbounded();
-@@ -296,6 +454,7 @@ impl Vcpu {
+@@ -296,6 +460,7 @@ impl Vcpu {
              response_sender,
              vcpu_list,
              nested_enabled,
@@ -660,7 +666,7 @@ index 893e086..6cd0160 100644
          })
      }
  
-@@ -450,9 +609,13 @@ impl Vcpu {
+@@ -450,9 +615,13 @@ impl Vcpu {
  
          let (wfe_sender, wfe_receiver) = unbounded();
          self.vcpu_list.register(hvf_vcpuid, wfe_sender);
@@ -675,7 +681,7 @@ index 893e086..6cd0160 100644
          } else {
              self.boot_entry_addr
          };
-@@ -461,7 +624,11 @@ impl Vcpu {
+@@ -461,7 +630,11 @@ impl Vcpu {
              .set_initial_state(self.ipa_size, entry_addr, self.fdt_addr)
              .unwrap_or_else(|_| panic!("Can't set HVF vCPU {hvf_vcpuid} initial state"));
  
@@ -687,7 +693,7 @@ index 893e086..6cd0160 100644
              match self.run_emulation(&mut hvf_vcpu) {
                  // Emulation ran successfully, continue.
                  Ok(VcpuEmulation::Handled) => (),
-@@ -496,6 +663,7 @@ impl Vcpu {
+@@ -496,6 +669,7 @@ impl Vcpu {
          timeout: Option<Duration>,
      ) {
          if self.vcpu_list.should_wait(hvf_vcpuid) {
@@ -695,7 +701,7 @@ index 893e086..6cd0160 100644
              if let Some(timeout) = timeout {
                  match receiver.recv_timeout(timeout) {
                      Ok(_) => {}
-@@ -507,6 +675,7 @@ impl Vcpu {
+@@ -507,6 +681,7 @@ impl Vcpu {
              } else {
                  receiver.recv().unwrap();
              }

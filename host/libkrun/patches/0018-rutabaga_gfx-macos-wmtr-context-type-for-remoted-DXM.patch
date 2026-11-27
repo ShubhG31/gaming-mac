@@ -240,7 +240,7 @@ new file mode 100644
 index 0000000..c039ef5
 --- /dev/null
 +++ b/src/rutabaga_gfx/src/wmtr.rs
-@@ -0,0 +1,1010 @@
+@@ -0,0 +1,1081 @@
 +// SPDX-License-Identifier: Apache-2.0
 +
 +//! wmtr: a virtio-gpu context type that carries DXMT's winemetal unix calls from a guest process
@@ -275,6 +275,7 @@ index 0000000..c039ef5
 +use std::collections::VecDeque;
 +use std::ffi::c_void;
 +use std::ffi::CString;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 +use std::sync::Arc;
 +use std::sync::Mutex;
 +use std::sync::OnceLock;
@@ -426,6 +427,10 @@ index 0000000..c039ef5
 +    blobs: Mutex<BTreeMap<u32, (usize, u64)>>,
 +    /// Fences not yet completed, per ring, in submission order.
 +    waiters: Mutex<BTreeMap<u8, VecDeque<Waiter>>>,
++    /// Bitmask of rings 0..64 with at least one pending waiter (lock-free fast path for cb_wake).
++    pending_rings: AtomicU64,
++    /// True when any ring >= 64 has a pending waiter.
++    has_high_waiters: AtomicBool,
 +    host: Mutex<usize>,
 +    fence_handler: RutabagaFenceHandler,
 +}
@@ -450,34 +455,76 @@ index 0000000..c039ef5
 +}
 +
 +impl Shared {
-+    /// The executor's progress on `slot`, 0 once teardown has begun. The handle lock is held
-+    /// across the call, so Drop cannot destroy the executor underneath it.
-+    fn progress(&self, slot: u32) -> u64 {
-+        let host = self.host.lock().unwrap();
-+        if *host == 0 {
-+            return 0;
++    fn mark_pending(&self, ring_idx: u8) {
++        if ring_idx < 64 {
++            self.pending_rings.fetch_or(1u64 << ring_idx, Ordering::SeqCst);
++        } else {
++            self.has_high_waiters.store(true, Ordering::SeqCst);
 +        }
-+        // SAFETY: host is a live executor handle: Drop zeroes it under this lock before destroy.
-+        unsafe { (self.lib.progress)(*host as *mut c_void, slot) }
 +    }
 +
-+    /// Completes the fences at the head of `queue` whose condition holds, in order, stopping at
++    /// The executor's progress on `slot`, 0 once teardown has begun. Caller holds `self.host`.
++    fn progress_with(&self, host_ptr: *mut c_void, slot: u32) -> u64 {
++        if host_ptr.is_null() {
++            return 0;
++        }
++        // SAFETY: host_ptr is a live executor handle: Drop zeroes it under `self.host` before destroy.
++        unsafe { (self.lib.progress)(host_ptr, slot) }
++    }
++
++    /// Collects the fences at the head of `queue` whose condition holds, in order, stopping at
 +    /// the first one that is still pending (later fences on the ring wait behind it).
-+    fn complete_ready(&self, queue: &mut VecDeque<Waiter>) {
++    fn collect_ready(
++        &self,
++        host_ptr: *mut c_void,
++        queue: &mut VecDeque<Waiter>,
++        ready: &mut Vec<RutabagaFence>,
++    ) {
 +        while let Some(w) = queue.front() {
-+            if !w.wait.iter().all(|&(slot, seq)| self.progress(slot) >= seq) {
++            if !w.wait.iter().all(|&(slot, seq)| self.progress_with(host_ptr, slot) >= seq) {
 +                break;
 +            }
-+            let w = queue.pop_front().unwrap();
-+            self.fence_handler.call(w.fence);
++            ready.push(queue.pop_front().unwrap().fence);
 +        }
 +    }
 +
 +    /// A reply arrived: any ring's head may now be ready (rings are shared between slots).
 +    fn signal_ready(&self) {
++        if self.pending_rings.load(Ordering::SeqCst) == 0
++            && !self.has_high_waiters.load(Ordering::SeqCst)
++        {
++            return;
++        }
 +        let mut rings = self.waiters.lock().unwrap();
-+        for queue in rings.values_mut() {
-+            self.complete_ready(queue);
++        let mut ready = Vec::new();
++        {
++            let host = self.host.lock().unwrap();
++            let host_ptr = *host as *mut c_void;
++            let mut cleared_mask = 0u64;
++            let mut high_remains = false;
++            rings.retain(|&ring_idx, queue| {
++                self.collect_ready(host_ptr, queue, &mut ready);
++                if queue.is_empty() {
++                    if ring_idx < 64 {
++                        cleared_mask |= 1u64 << ring_idx;
++                    }
++                    false
++                } else {
++                    if ring_idx >= 64 {
++                        high_remains = true;
++                    }
++                    true
++                }
++            });
++            if cleared_mask != 0 {
++                self.pending_rings.fetch_and(!cleared_mask, Ordering::Release);
++            }
++            if !high_remains && self.has_high_waiters.load(Ordering::Relaxed) {
++                self.has_high_waiters.store(false, Ordering::Release);
++            }
++        }
++        for fence in ready {
++            self.fence_handler.call(fence);
 +        }
 +    }
 +}
@@ -625,12 +672,30 @@ index 0000000..c039ef5
 +
 +    fn context_create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
 +        let wait = std::mem::take(&mut self.pending);
-+        // Enqueue and check under the waiter lock: the executor publishes progress before it
-+        // takes this lock in cb_wake, so a reply cannot slip between the push and the check.
++        let ring_idx = fence.ring_idx;
++        // Enqueue, publish pending bit (SeqCst), and check under the waiter lock: the executor
++        // publishes progress before loading pending_rings in cb_wake, so a reply cannot slip
++        // between the push and the check.
 +        let mut rings = self.shared.waiters.lock().unwrap();
-+        let queue = rings.entry(fence.ring_idx).or_default();
-+        queue.push_back(Waiter { fence, wait });
-+        self.shared.complete_ready(queue);
++        let mut ready = Vec::new();
++        {
++            let queue = rings.entry(ring_idx).or_default();
++            queue.push_back(Waiter { fence, wait });
++            self.shared.mark_pending(ring_idx);
++            let host = self.shared.host.lock().unwrap();
++            self.shared.collect_ready(*host as *mut c_void, queue, &mut ready);
++            if queue.is_empty() {
++                rings.remove(&ring_idx);
++                if ring_idx < 64 {
++                    self.shared.pending_rings.fetch_and(!(1u64 << ring_idx), Ordering::Release);
++                } else if !rings.keys().any(|&r| r >= 64) {
++                    self.shared.has_high_waiters.store(false, Ordering::Release);
++                }
++            }
++        }
++        for f in ready {
++            self.shared.fence_handler.call(f);
++        }
 +        Ok(())
 +    }
 +
@@ -696,9 +761,14 @@ index 0000000..c039ef5
 +            unsafe { (self.shared.lib.destroy)(h) };
 +        }
 +        // complete anything still waiting (in ring order) so guest pollers do not hang
-+        for queue in self.shared.waiters.lock().unwrap().values_mut() {
-+            for w in queue.drain(..) {
-+                self.shared.fence_handler.call(w.fence);
++        {
++            let mut rings = self.shared.waiters.lock().unwrap();
++            self.shared.pending_rings.store(0, Ordering::Release);
++            self.shared.has_high_waiters.store(false, Ordering::Release);
++            for queue in rings.values_mut() {
++                for w in queue.drain(..) {
++                    self.shared.fence_handler.call(w.fence);
++                }
 +            }
 +        }
 +        for &(p, n) in &self.maps {
@@ -763,6 +833,8 @@ index 0000000..c039ef5
 +                lib: self.lib,
 +                blobs: Mutex::new(BTreeMap::new()),
 +                waiters: Mutex::new(BTreeMap::new()),
++                pending_rings: AtomicU64::new(0),
++                has_high_waiters: AtomicBool::new(false),
 +                host: Mutex::new(0),
 +                fence_handler,
 +            }),
@@ -779,7 +851,6 @@ index 0000000..c039ef5
 +    //! The context against a stand-in executor (no Metal, no host library): blob 0 backs the ring,
 +    //! RING starts the executor, a WAIT fence completes exactly when the executor reports progress.
 +    use super::*;
-+    use std::sync::atomic::{AtomicU64, Ordering};
 +
 +    struct Fake {
 +        ops: *const WmtrHostOps,

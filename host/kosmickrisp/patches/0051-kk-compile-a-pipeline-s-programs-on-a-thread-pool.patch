@@ -442,7 +442,7 @@ index 0de5fdc..4064d85 100644
     return library;
  }
  
-@@ -2059,6 +2097,146 @@ kk_compile_program(struct kk_device *dev, struct kk_shader *s)
+@@ -2059,6 +2097,149 @@ kk_compile_program(struct kk_device *dev, struct kk_shader *s)
     return result;
  }
  
@@ -460,6 +460,9 @@ index 0de5fdc..4064d85 100644
 +kk_compile_worker(void *data)
 +{
 +   struct kk_device *dev = data;
++#ifdef __APPLE__
++   pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
++#endif
 +
 +   mtx_lock(&dev->compile_mtx);
 +   for (;;) {
@@ -589,7 +592,7 @@ index 0de5fdc..4064d85 100644
  /* Graphics pipeline state the VS of a program holds. */
  static void
  kk_gather_program(struct kk_device *dev,
-@@ -2087,9 +2265,8 @@ kk_gather_program(struct kk_device *dev,
+@@ -2087,9 +2268,8 @@ kk_gather_program(struct kk_device *dev,
   * one of those sets' layouts already got a reduction sampler (descriptor
   * heaps: vkd3d-proton's sampler heap is then bound with every draw; for
   * pipelines read from a pipeline cache, any set); the program not compiled at
@@ -601,7 +604,7 @@ index 0de5fdc..4064d85 100644
  static bool
  kk_minmax_layouts_used(uint32_t minmax_sets, uint32_t set_layout_count,
                         struct vk_descriptor_set_layout *const *set_layouts)
-@@ -2105,38 +2282,6 @@ kk_minmax_layouts_used(uint32_t minmax_sets, uint32_t set_layout_count,
+@@ -2105,38 +2285,6 @@ kk_minmax_layouts_used(uint32_t minmax_sets, uint32_t set_layout_count,
     return false;
  }
  
@@ -640,7 +643,7 @@ index 0de5fdc..4064d85 100644
  static VkResult
  kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
                     struct vk_shader_compile_info *infos,
-@@ -2183,18 +2328,6 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+@@ -2183,18 +2331,6 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
     if (s->vk.stage != MESA_SHADER_COMPUTE)
        kk_gather_program(dev, state, shaders, total_shaders);
  
@@ -659,7 +662,7 @@ index 0de5fdc..4064d85 100644
     if (minmax_sets) {
        struct kk_shader *minmax_shaders[shader_count + 2u];
        bool minmax_generated[shader_count + 2u];
-@@ -2213,12 +2346,17 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
+@@ -2213,12 +2349,17 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
        }
     }
  
@@ -683,7 +686,7 @@ index 0de5fdc..4064d85 100644
     }
  
     /* The VS has the pipeline data now, so free the generated shaders. */
-@@ -2401,11 +2539,16 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
+@@ -2401,11 +2542,16 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
           goto fail;
     }
  
@@ -705,7 +708,7 @@ index 0de5fdc..4064d85 100644
  
     if (result != VK_SUCCESS)
        goto fail;
-@@ -2431,60 +2574,72 @@ kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd, struct kk_shader *shader)
+@@ -2431,60 +2577,72 @@ kk_cmd_bind_compute_shader(struct kk_cmd_buffer *cmd, struct kk_shader *shader)
   * update-after-bind set may get one after recording, before submission: such
   * sets are recorded for kk_queue_submit, which then re-records the command
   * buffer from its command queue. One-time-submit command buffers have no
@@ -820,7 +823,7 @@ index 0de5fdc..4064d85 100644
        }
     }
     return &program->pipeline;
-@@ -2502,6 +2657,13 @@ kk_cmd_bind_graphics_shader(struct kk_cmd_buffer *cmd,
+@@ -2502,6 +2660,13 @@ kk_cmd_bind_graphics_shader(struct kk_cmd_buffer *cmd,
     if (stage != MESA_SHADER_VERTEX)
        return;
  

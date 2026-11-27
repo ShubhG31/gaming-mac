@@ -36,7 +36,7 @@ diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_e
  
  #include <Metal/MTL4CommandBuffer.h>
  #include <Metal/MTL4ComputeCommandEncoder.h>
-@@ -12,6 +19,191 @@
+@@ -12,6 +19,193 @@
  #include <Metal/MTL4RenderCommandEncoder.h>
  #include <Metal/MTLRenderPass.h>
  
@@ -89,6 +89,8 @@ diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_e
 +static struct encoder_texture_shape
 +encoder_texture_shape(id<MTLTexture> texture)
 +{
++   if (texture == nil)
++      return (struct encoder_texture_shape){0};
 +   return (struct encoder_texture_shape) {
 +      texture.pixelFormat, texture.textureType,
 +      texture.width, texture.height, texture.depth,
@@ -228,7 +230,7 @@ diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_e
  /* Common encoder utils */
  void
  mtl_end_encoding(void *encoder)
-@@ -150,6 +342,8 @@
+@@ -150,6 +344,8 @@
        id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
        id<MTLBuffer> buffer = (id<MTLBuffer>)data->buffer;
        id<MTLTexture> image = (id<MTLTexture>)data->image;
@@ -237,7 +239,7 @@ diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_e
        [enc copyFromBuffer:buffer
               sourceOffset:data->buffer_offset_B
          sourceBytesPerRow:data->buffer_stride_B
-@@ -160,6 +354,9 @@
+@@ -160,6 +356,9 @@
           destinationLevel:data->image_level
          destinationOrigin:origin
                    options:(MTLBlitOption)data->options];
@@ -247,7 +249,7 @@ diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_e
     }
  }
  
-@@ -173,6 +370,8 @@
+@@ -173,6 +372,8 @@
        id<MTL4ComputeCommandEncoder> enc = (id<MTL4ComputeCommandEncoder>)encoder;
        id<MTLBuffer> buffer = (id<MTLBuffer>)data->buffer;
        id<MTLTexture> image = (id<MTLTexture>)data->image;
@@ -256,7 +258,7 @@ diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_e
        [enc copyFromTexture:image
                 sourceSlice:data->image_slice
                 sourceLevel:data->image_level
-@@ -183,6 +382,9 @@
+@@ -183,6 +384,9 @@
      destinationBytesPerRow:data->buffer_stride_B
    destinationBytesPerImage:data->buffer_2d_image_size_B
                     options:(MTLBlitOption)data->options];
@@ -266,7 +268,7 @@ diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_e
     }
  }
  
-@@ -284,7 +486,13 @@
+@@ -284,7 +488,13 @@
     @autoreleasepool {
        id<MTL4CommandBuffer> cmd = (id<MTL4CommandBuffer>)command_buffer;
        MTL4RenderPassDescriptor *desc = (MTL4RenderPassDescriptor *)descriptor;

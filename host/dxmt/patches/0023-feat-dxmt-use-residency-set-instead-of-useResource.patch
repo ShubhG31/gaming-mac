@@ -198,7 +198,7 @@ diff --git a/src/dxmt/dxmt_residency.hpp b/src/dxmt/dxmt_residency.hpp
 index 6a3300043a977e67f7efe305771029801409aed4..c97d2bc0be48873d662a44e03dc07477bd926e97 100644
 --- a/src/dxmt/dxmt_residency.hpp
 +++ b/src/dxmt/dxmt_residency.hpp
-@@ -1,10 +1,65 @@
+@@ -1,10 +1,87 @@
  #pragma once
  #include "winemetal.h"
 +#include "Metal.hpp"
@@ -206,18 +206,25 @@ index 6a3300043a977e67f7efe305771029801409aed4..c97d2bc0be48873d662a44e03dc07477
 +#include <atomic>
  #include <cstdint>
 +#include <mutex>
++#include <vector>
  #include "ftl.hpp"
  
  namespace dxmt {
  
 +/**
 +An `MTLResidencySet` attached to the command queue, which replaces per-encoder
-+`useResource`. Allocations are added on first use, and committed right before
-+the command buffer that uses them. Removal (once freed) is committed immediately.
++`useResource`. Allocations are batched on first use and flushed before the
++command buffer that uses them. Removals call `removeAllocations` immediately
++while the handle is still alive, and batch `commit` until the next command
++chunk (or every kRemoveCommitBatch removals when idle).
 +*/
 +class ResidencySetTracker {
 +public:
-+  ResidencySetTracker(WMT::Reference<WMT::ResidencySet> &&set) : set_(std::move(set)) {}
++  static constexpr uint32_t kRemoveCommitBatch = 64u;
++
++  ResidencySetTracker(WMT::Reference<WMT::ResidencySet> &&set) : set_(std::move(set)) {
++    pending_adds_.reserve(64u);
++  }
 +
 +  void
 +  incRef() {
@@ -233,16 +240,24 @@ index 6a3300043a977e67f7efe305771029801409aed4..c97d2bc0be48873d662a44e03dc07477
 +  void
 +  add(WMT::Allocation allocation) {
 +    std::lock_guard<dxmt::mutex> lock(mutex_);
-+    set_.addAllocations(&allocation, 1);
++    pending_adds_.push_back(allocation);
 +    dirty_ = true;
 +  }
 +
 +  void
 +  remove(WMT::Allocation allocation) {
 +    std::lock_guard<dxmt::mutex> lock(mutex_);
++    if (!pending_adds_.empty()) {
++      set_.addAllocations(pending_adds_.data(), pending_adds_.size());
++      pending_adds_.clear();
++    }
 +    set_.removeAllocations(&allocation, 1);
-+    set_.commit();
-+    dirty_ = false;
++    dirty_ = true;
++    if (++pending_removes_ >= kRemoveCommitBatch) {
++      set_.commit();
++      pending_removes_ = 0;
++      dirty_ = false;
++    }
 +  }
 +
 +  void
@@ -250,7 +265,12 @@ index 6a3300043a977e67f7efe305771029801409aed4..c97d2bc0be48873d662a44e03dc07477
 +    std::lock_guard<dxmt::mutex> lock(mutex_);
 +    if (!dirty_)
 +      return;
++    if (!pending_adds_.empty()) {
++      set_.addAllocations(pending_adds_.data(), pending_adds_.size());
++      pending_adds_.clear();
++    }
 +    set_.commit();
++    pending_removes_ = 0;
 +    dirty_ = false;
 +  }
 +
@@ -258,6 +278,8 @@ index 6a3300043a977e67f7efe305771029801409aed4..c97d2bc0be48873d662a44e03dc07477
 +  std::atomic<uint32_t> refcount_ = {0u};
 +  dxmt::mutex mutex_;
 +  WMT::Reference<WMT::ResidencySet> set_;
++  std::vector<WMT::Allocation> pending_adds_;
++  uint32_t pending_removes_ = 0;
 +  bool dirty_ = false;
 +};
 +

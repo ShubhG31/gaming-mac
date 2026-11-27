@@ -31,19 +31,20 @@ diff --git a/src/kosmickrisp/vulkan/kk_device.c b/src/kosmickrisp/vulkan/kk_devi
 index c3541fc..e3b8879 100644
 --- a/src/kosmickrisp/vulkan/kk_device.c
 +++ b/src/kosmickrisp/vulkan/kk_device.c
-@@ -31,6 +31,7 @@
+@@ -31,6 +31,8 @@
  #include "vk_pipeline_cache.h"
  
  #include "util/os_time.h"
 +#include "util/set.h"
  
++#include <pthread.h>
  #include <stdio.h>
  #include <time.h>
-@@ -391,6 +392,12 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
+@@ -391,6 +393,12 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
     dev->vk.command_buffer_ops = &kk_cmd_buffer_ops;
     dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
     dev->vk.get_timestamp = kk_get_timestamp;
-+   simple_mtx_init(&dev->live_image_views_lock, mtx_plain);
++   pthread_rwlock_init(&dev->live_image_views_lock, NULL);
 +   dev->live_image_views = _mesa_pointer_set_create(NULL);
 +   if (dev->live_image_views == NULL) {
 +      result = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -52,22 +53,22 @@ index c3541fc..e3b8879 100644
     /* Compiled MSL libraries and Metal pipeline states are shared between equal
      * pipelines and the pool compiles into them: both are set up before any
      * pipeline is created. */
-@@ -485,6 +492,8 @@ fail_init:
+@@ -485,6 +493,8 @@ fail_init:
     kk_compile_pool_finish(dev);
     kk_metal_caches_finish(dev);
  fail_device:
 +   _mesa_set_destroy(dev->live_image_views, NULL);
-+   simple_mtx_destroy(&dev->live_image_views_lock);
++   pthread_rwlock_destroy(&dev->live_image_views_lock);
     vk_device_finish(&dev->vk);
  fail_alloc:
     vk_free(&dev->vk.alloc, dev);
-@@ -540,6 +549,10 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+@@ -540,6 +550,10 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
  
     kk_release_compiler(dev);
  
 +   /* After meta, the last creator of image views */
 +   _mesa_set_destroy(dev->live_image_views, NULL);
-+   simple_mtx_destroy(&dev->live_image_views_lock);
++   pthread_rwlock_destroy(&dev->live_image_views_lock);
 +
     vk_device_finish(&dev->vk);
  
@@ -82,7 +83,7 @@ index 0eba6fc..64f2813 100644
     struct kk_residency_set residency_set;
 +   /* Image views created and not destroyed yet: a render pass naming another
 +    * is logged before Mesa's common code dereferences it (STEAMAC-BJ/BK) */
-+   simple_mtx_t live_image_views_lock;
++   pthread_rwlock_t live_image_views_lock;
 +   struct set *live_image_views;
  
     struct kk_precompiled_cache precompiled_cache;
@@ -99,7 +100,7 @@ index 3f18c03..0e7bb5a 100644
  #include "kk_device.h"
  #include "kk_entrypoints.h"
  #include "kk_format.h"
-@@ -16,7 +17,13 @@
+@@ -16,7 +17,14 @@
  #include "kosmickrisp/bridge/mtl_bridge.h"
  #include "kosmickrisp/bridge/mtl_format.h"
  
@@ -110,16 +111,17 @@ index 3f18c03..0e7bb5a 100644
  #include "vk_format.h"
 +#include "vk_framebuffer.h"
 +#include "vk_render_pass.h"
++#include <pthread.h>
  
  static enum pipe_swizzle
  vk_swizzle_to_pipe(VkComponentSwizzle swizzle)
-@@ -458,6 +465,15 @@ kk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
+@@ -458,6 +466,15 @@ kk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
        return result;
     }
  
-+   simple_mtx_lock(&dev->live_image_views_lock);
++   pthread_rwlock_wrlock(&dev->live_image_views_lock);
 +   const bool tracked = _mesa_set_add(dev->live_image_views, view) != NULL;
-+   simple_mtx_unlock(&dev->live_image_views_lock);
++   pthread_rwlock_unlock(&dev->live_image_views_lock);
 +   if (!tracked) {
 +      kk_image_view_finish(dev, view);
 +      vk_free2(&dev->vk.alloc, pAllocator, view);
@@ -129,13 +131,13 @@ index 3f18c03..0e7bb5a 100644
     *pView = kk_image_view_to_handle(view);
  
     return VK_SUCCESS;
-@@ -473,10 +489,61 @@ kk_DestroyImageView(VkDevice _device, VkImageView imageView,
+@@ -473,10 +490,66 @@ kk_DestroyImageView(VkDevice _device, VkImageView imageView,
     if (!view)
        return;
  
-+   simple_mtx_lock(&dev->live_image_views_lock);
++   pthread_rwlock_wrlock(&dev->live_image_views_lock);
 +   _mesa_set_remove_key(dev->live_image_views, view);
-+   simple_mtx_unlock(&dev->live_image_views_lock);
++   pthread_rwlock_unlock(&dev->live_image_views_lock);
 +
     kk_image_view_finish(dev, view);
     vk_free2(&dev->vk.alloc, pAllocator, view);
@@ -154,6 +156,11 @@ index 3f18c03..0e7bb5a 100644
 +{
 +   VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
 +   VK_FROM_HANDLE(vk_render_pass, pass, pRenderPassBeginInfo->renderPass);
++   if (pass->attachment_count == 0) {
++      vk_common_CmdBeginRenderPass2(commandBuffer, pRenderPassBeginInfo,
++                                    pSubpassBeginInfo);
++      return;
++   }
 +   VK_FROM_HANDLE(vk_framebuffer, framebuffer,
 +                  pRenderPassBeginInfo->framebuffer);
 +   struct kk_device *dev = kk_cmd_buffer_device(cmd);
@@ -166,7 +173,7 @@ index 3f18c03..0e7bb5a 100644
 +   const VkImageView *views =
 +      imageless ? attach_begin->pAttachments : framebuffer->attachments;
 +
-+   simple_mtx_lock(&dev->live_image_views_lock);
++   pthread_rwlock_rdlock(&dev->live_image_views_lock);
 +   for (uint32_t a = 0; a < pass->attachment_count; a++) {
 +      const void *view = kk_image_view_from_handle(views[a]);
 +      if (view != NULL && _mesa_set_search(dev->live_image_views, view))
@@ -182,7 +189,7 @@ index 3f18c03..0e7bb5a 100644
 +                framebuffer, framebuffer->width, framebuffer->height,
 +                framebuffer->layers);
 +   }
-+   simple_mtx_unlock(&dev->live_image_views_lock);
++   pthread_rwlock_unlock(&dev->live_image_views_lock);
 +
 +   vk_common_CmdBeginRenderPass2(commandBuffer, pRenderPassBeginInfo,
 +                                 pSubpassBeginInfo);

@@ -74,11 +74,18 @@ index 6fbe13b..6dd8a1f 100644
        return true;
     if (device != last_device) {
        last_device = device;
-@@ -47,16 +54,32 @@
+@@ -47,16 +54,38 @@
     return enabled;
  }
  
 +static uint64_t encoder_thread_id(void);
++static _Thread_local unsigned encoder_shape_count;
++
++static inline bool
++encoder_shapes_exhausted(void)
++{
++   return !encoder_log_all && encoder_shape_count > ENCODER_SHAPES_LOGGED;
++}
 +
  static bool
  encoder_log_shape(uint32_t hash)
@@ -89,7 +96,6 @@ index 6fbe13b..6dd8a1f 100644
 -   if (!encoder_log_all && occupied[slot] && shapes[slot] == hash)
 +   static _Thread_local uint32_t shapes[ENCODER_SHAPE_SLOTS];
 +   static _Thread_local bool occupied[ENCODER_SHAPE_SLOTS];
-+   static _Thread_local unsigned count;
 +   if (encoder_log_all)
 +      return true;
 +   unsigned slot = hash % ENCODER_SHAPE_SLOTS;
@@ -98,19 +104,29 @@ index 6fbe13b..6dd8a1f 100644
 +         return false;
 +      slot = (slot + 1) % ENCODER_SHAPE_SLOTS;
 +   }
-+   if (count == ENCODER_SHAPES_LOGGED) {
++   if (encoder_shape_count == ENCODER_SHAPES_LOGGED) {
 +      fprintf(stderr, "kk: encoder shapes: %u logged on thread %" PRIu64
-+              ", not logging new ones\n", count, encoder_thread_id());
-+      count++;
++              ", not logging new ones\n", encoder_shape_count, encoder_thread_id());
++      encoder_shape_count++;
 +   }
-+   if (count > ENCODER_SHAPES_LOGGED)
++   if (encoder_shape_count > ENCODER_SHAPES_LOGGED)
        return false;
     shapes[slot] = hash;
     occupied[slot] = true;
-+   count++;
++   encoder_shape_count++;
     return true;
  }
  
+@@ -102,7 +131,9 @@
+ static bool
+ encoder_log_buffer_texture(struct mtl_buffer_image_copy *data,
+                            bool to_texture, uint32_t *hash)
+ {
++   if (encoder_shapes_exhausted())
++      return false;
+    id<MTLBuffer> buffer = (id<MTLBuffer>)data->buffer;
+    id<MTLTexture> texture = (id<MTLTexture>)data->image;
+    if (!encoder_diagnostics_enabled(texture.device ?: buffer.device) && buffer && texture)
 diff --git a/src/kosmickrisp/bridge/stubs/mtl_encoder.c b/src/kosmickrisp/bridge/stubs/mtl_encoder.c
 index c0e096e..d452ceb 100644
 --- a/src/kosmickrisp/bridge/stubs/mtl_encoder.c

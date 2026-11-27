@@ -131,7 +131,8 @@ fi
 
 rm -rf "$build" "$stage"
 PATH="$work/venv/bin:$PATH" meson setup "$build" "$src" \
-	--prefix="$out" --libdir=lib --buildtype=release \
+	--prefix="$out" --libdir=lib --buildtype=release -Db_ndebug=true \
+	-Dc_args=-mcpu=apple-m1 \
 	-Dvenus=true -Dvulkan-dload=true \
 	-Drender-server-mode=thread -Drender-server-worker=thread \
 	-Dneptune=false -Dvtest=false -Dtests=false -Dvideo=false \

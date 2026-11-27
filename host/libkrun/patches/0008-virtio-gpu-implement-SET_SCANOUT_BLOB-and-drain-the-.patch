@@ -83,7 +83,7 @@ index 1df37c8..3bd644b 100644
  #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
  use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
  use rutabaga_gfx::{
-@@ -164,15 +164,77 @@ fn host_page_size() -> u64 {
+@@ -164,15 +164,115 @@ fn host_page_size() -> u64 {
      unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
  }
  
@@ -119,6 +119,44 @@ index 1df37c8..3bd644b 100644
 +        return true;
 +    }
 +    let row_len = dst.len() / rows;
++    if row_len == 0 {
++        return true;
++    }
++    if let &[(base, len)] = regions {
++        // Fast path for contiguous host shm mappings (all macOS Venus blob scanouts).
++        let Some(end) = (rows as u64 - 1)
++            .checked_mul(stride)
++            .and_then(|span| offset.checked_add(span))
++            .and_then(|last| last.checked_add(row_len as u64))
++        else {
++            return false;
++        };
++        if end > len as u64 {
++            return false;
++        }
++        if stride == row_len as u64 {
++            // SAFETY: [base + offset, base + offset + row_len * rows) is inside [base, base + len),
++            // and `dst` has at least `row_len * rows` bytes of distinct VMM-owned memory.
++            unsafe {
++                std::ptr::copy_nonoverlapping(
++                    (base + offset as usize) as *const u8,
++                    dst.as_mut_ptr(),
++                    row_len * rows,
++                )
++            };
++            return true;
++        }
++        let mut src = base + offset as usize;
++        let stride_usize = stride as usize;
++        for row in dst.chunks_exact_mut(row_len) {
++            // SAFETY: every row lies within [base, base + len) per the `end` check above.
++            unsafe {
++                std::ptr::copy_nonoverlapping(src as *const u8, row.as_mut_ptr(), row_len);
++            }
++            src += stride_usize;
++        }
++        return true;
++    }
 +    // Rows only move forward, so the region search resumes where it stopped.
 +    let mut idx = 0;
 +    let mut region_start = 0u64;
@@ -161,7 +199,7 @@ index 1df37c8..3bd644b 100644
      fence_state: Arc<Mutex<FenceState>>,
      #[cfg(target_os = "macos")]
      map_sender: Sender<WorkerMessage>,
-@@ -390,6 +452,7 @@ impl VirtioGpu {
+@@ -390,6 +490,7 @@ impl VirtioGpu {
          Self {
              rutabaga,
              resources: Default::default(),
@@ -169,7 +207,7 @@ index 1df37c8..3bd644b 100644
              fence_state,
              scanouts: Default::default(),
              displays,
-@@ -486,6 +549,7 @@ impl VirtioGpu {
+@@ -486,6 +587,7 @@ impl VirtioGpu {
              }
          }
  
@@ -177,7 +215,7 @@ index 1df37c8..3bd644b 100644
          self.rutabaga.unref_resource(resource_id)?;
          Ok(OkNoData)
      }
-@@ -496,6 +560,103 @@ impl VirtioGpu {
+@@ -496,6 +598,103 @@ impl VirtioGpu {
          resource_id: u32,
          width: u32,
          height: u32,
@@ -281,7 +319,7 @@ index 1df37c8..3bd644b 100644
      ) -> VirtioGpuResult {
          let scanout = self
              .scanouts
-@@ -504,53 +665,50 @@ impl VirtioGpu {
+@@ -504,53 +703,50 @@ impl VirtioGpu {
  
          // If a resource is already associated with this scanout, make sure to disable
          // this scanout for that resource
@@ -361,7 +399,7 @@ index 1df37c8..3bd644b 100644
          });
          Ok(OkNoData)
      }
-@@ -579,6 +737,20 @@ impl VirtioGpu {
+@@ -579,6 +775,20 @@ impl VirtioGpu {
          rutabaga.transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
      }
  
@@ -382,7 +420,7 @@ index 1df37c8..3bd644b 100644
      /// If the resource is the scanout resource, flush it to the display.
      pub fn flush_resource(&mut self, resource_id: u32, rect: Rect) -> VirtioGpuResult {
          if resource_id == 0 {
-@@ -591,11 +763,49 @@ impl VirtioGpu {
+@@ -591,11 +801,49 @@ impl VirtioGpu {
              .ok_or(ErrInvalidResourceId)?;
  
          for scanout_id in resource.scanouts.iter_enabled() {
@@ -434,7 +472,7 @@ index 1df37c8..3bd644b 100644
              // Present the frame even if the read failed: the display API has no
              // way to release it, and a backend may not hand out another one.
              self.display_backend
-@@ -798,11 +1008,19 @@ impl VirtioGpu {
+@@ -798,11 +1046,19 @@ impl VirtioGpu {
          let mut rutabaga_iovecs = None;
  
          if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
@@ -455,7 +493,7 @@ index 1df37c8..3bd644b 100644
  
          self.rutabaga.resource_create_blob(
              ctx_id,
-@@ -816,6 +1034,9 @@ impl VirtioGpu {
+@@ -816,6 +1072,9 @@ impl VirtioGpu {
  
          // Rely on rutabaga to check for duplicate resource ids.
          self.resources.insert(resource_id, resource);
@@ -465,7 +503,7 @@ index 1df37c8..3bd644b 100644
          Ok(self.result_from_query(resource_id))
      }
  
-@@ -1312,6 +1533,8 @@ mod test {
+@@ -1312,6 +1571,8 @@ mod test {
              resource_id: 1,
              width: 2,
              height: 2,
@@ -474,7 +512,7 @@ index 1df37c8..3bd644b 100644
          };
          let mut frame = [0u8; 2 * 2 * 4];
          VirtioGpu::read_2d_resource(&mut rutabaga, resource, &scanout, &mut frame).unwrap();
-@@ -1320,4 +1543,25 @@ mod test {
+@@ -1320,4 +1581,34 @@ mod test {
          assert_eq!(frame[..2 * 4], *row(0));
          assert_eq!(frame[2 * 4..], *row(1));
      }
@@ -495,6 +533,15 @@ index 1df37c8..3bd644b 100644
 +        assert!(copy_blob_rows(&regions, 16 + 4, 16, 2, &mut frame));
 +        assert_eq!(frame[..8], blob[20..28]);
 +        assert_eq!(frame[8..], blob[36..44]);
++
++        // Single-region fast paths (tightly packed and strided).
++        let single = [(blob.as_ptr() as usize, blob.len())];
++        assert!(copy_blob_rows(&single, 16 + 4, 16, 2, &mut frame));
++        assert_eq!(frame[..8], blob[20..28]);
++        assert_eq!(frame[8..], blob[36..44]);
++        assert!(copy_blob_rows(&single, 8, 8, 2, &mut frame));
++        assert_eq!(frame, blob[8..24]);
++        assert!(!copy_blob_rows(&single, 32 + 4, 16, 2, &mut frame));
 +
 +        // A row past the end of the regions is refused.
 +        assert!(!copy_blob_rows(&regions, 32 + 4, 16, 2, &mut frame));

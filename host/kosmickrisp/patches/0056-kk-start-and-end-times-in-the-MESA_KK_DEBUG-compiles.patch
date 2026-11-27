@@ -18,7 +18,7 @@ diff --git a/src/kosmickrisp/bridge/mtl_compiler.m b/src/kosmickrisp/bridge/mtl_
 index 64b7eed..9aab72f 100644
 --- a/src/kosmickrisp/bridge/mtl_compiler.m
 +++ b/src/kosmickrisp/bridge/mtl_compiler.m
-@@ -160,10 +160,11 @@
+@@ -167,10 +167,11 @@
     pthread_threadid_np(NULL, &thread);
     fprintf(stderr,
             "kk: compile %s%s on thread %" PRIu64 " with MTL4Compiler %u: %.1f ms%s; "

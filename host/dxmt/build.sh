@@ -162,7 +162,9 @@ step_native() {
     [ -f "$src/meson.build" ] || die "no DXMT source: run the fetch step"
     [ -f "$llvm/.pin" ] || die "no LLVM 15: run the llvm step"
     # shellcheck disable=SC2046
-    meson setup --wipe "$native" "$src" --buildtype release -Dnative_llvm_path="$llvm" $(metal_opts) >/dev/null
+    meson setup --wipe "$native" "$src" --buildtype release \
+        -Dc_args=-mcpu=apple-m1 -Dcpp_args=-mcpu=apple-m1 \
+        -Dnative_llvm_path="$llvm" $(metal_opts) >/dev/null
     ninja -C "$native" src/airconv/darwin/libairconv.a libs/DXBCParser/libDXBCParserNative.a
 }
 

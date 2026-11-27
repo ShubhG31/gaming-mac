@@ -43,10 +43,10 @@ index 83d3be3..e89509c 100644
 +uint64_t
 +mtl_command_allocator_allocated_size(mtl_command_allocator *allocator)
 +{
-+   @autoreleasepool {
-+      id<MTL4CommandAllocator> alloc = (id<MTL4CommandAllocator>)allocator;
-+      return alloc.allocatedSize;
-+   }
++   if (allocator == NULL)
++      return 0;
++   id<MTL4CommandAllocator> alloc = (id<MTL4CommandAllocator>)allocator;
++   return alloc.allocatedSize;
 +}
 +
  void
@@ -141,7 +141,7 @@ index 0e00989..e34d243 100644
  #include "vk_alloc.h"
  #include "vk_common_entrypoints.h"
  #include "vk_format.h"
-@@ -76,6 +80,94 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
+@@ -76,6 +80,95 @@ kk_cmd_release_resources(struct kk_device *dev, struct kk_cmd_buffer *cmd)
     kk_cmd_release_cmd_bufs(cmd);
  }
  
@@ -175,19 +175,20 @@ index 0e00989..e34d243 100644
 +{
 +   const uint32_t encoders =
 +      cmd->record.render_passes + cmd->record.compute_encoders;
-+   if (!ending && (encoders < 1024 || (encoders & (encoders - 1))))
++   if (likely(!ending && (encoders < 1024 || (encoders & (encoders - 1)))))
 +      return;
 +
 +   const uint64_t bytes =
 +      mtl_command_allocator_allocated_size(cmd->metal.allocator);
-+   const uint64_t pre_bytes =
-+      mtl_command_allocator_allocated_size(cmd->metal.pre_gfx.allocator);
++   const uint64_t pre_bytes = cmd->metal.pre_gfx.allocator
++      ? mtl_command_allocator_allocated_size(cmd->metal.pre_gfx.allocator)
++      : 0;
 +   static uint64_t storage_high_water, encoder_high_water;
 +   const bool storage_growth = kk_storage_high_water(
 +      &storage_high_water, bytes + pre_bytes, 64ull * 1024 * 1024);
 +   const bool encoder_growth =
 +      kk_storage_high_water(&encoder_high_water, encoders, 1024);
-+   if (!storage_growth && !encoder_growth && !KK_DEBUG(CBS))
++   if (likely(!storage_growth && !encoder_growth && !KK_DEBUG(CBS)))
 +      return;
 +
 +   struct kk_device *dev = kk_cmd_buffer_device(cmd);
@@ -236,7 +237,7 @@ index 0e00989..e34d243 100644
  /* Ends Metal command buffer recording and returns allocators to pool for
   * reuse */
  static void
-@@ -84,6 +176,7 @@ end_recording(struct kk_cmd_buffer *cmd)
+@@ -84,6 +177,7 @@ end_recording(struct kk_cmd_buffer *cmd)
     if (cmd->vk.state != MESA_VK_COMMAND_BUFFER_STATE_RECORDING)
        return;
  
@@ -244,7 +245,7 @@ index 0e00989..e34d243 100644
     cs_end(cmd);
     cmd->record.metal_cmd_bufs = MIN2(
        util_dynarray_num_elements(&cmd->metal.cmd_bufs, mtl_command_buffer *),
-@@ -263,6 +356,8 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+@@ -263,6 +357,8 @@ kk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
     util_dynarray_append(&cmd->metal.cmd_bufs, cmd->metal.cmd_buf);
     cmd->metal.cmd_buf_used = false;
     cmd->metal.ts_writes = 0;
@@ -253,7 +254,7 @@ index 0e00989..e34d243 100644
     mtl_begin_command_buffer(cmd->metal.cmd_buf, cmd->metal.allocator);
  
     return VK_SUCCESS;
-@@ -332,6 +427,8 @@ kk_cmd_next_cmd_buf_after_pre_gfx(struct kk_cmd_buffer *cmd)
+@@ -332,6 +428,8 @@ kk_cmd_next_cmd_buf_after_pre_gfx(struct kk_cmd_buffer *cmd)
     mtl_command_allocator *allocator = cmd->metal.pre_gfx.allocator;
     cmd->metal.pre_gfx.allocator = cmd->metal.allocator;
     cmd->metal.pre_gfx.cmd_buf = cmd->metal.cmd_buf;
@@ -262,7 +263,7 @@ index 0e00989..e34d243 100644
     cmd->metal.allocator = allocator;
  
     mtl_begin_command_buffer(next, allocator);
-@@ -369,6 +466,7 @@ kk_cmd_count_ts_writes(struct kk_cmd_buffer *cmd, uint32_t writes)
+@@ -369,6 +467,7 @@ kk_cmd_count_ts_writes(struct kk_cmd_buffer *cmd, uint32_t writes)
     cmd->metal.cmd_buf = next;
     cmd->metal.cmd_buf_used = false;
     cmd->metal.ts_writes = 0;
@@ -270,7 +271,7 @@ index 0e00989..e34d243 100644
  }
  
  /* A Metal command buffer of its own for the pre_gfx pass of the open render
-@@ -395,6 +493,7 @@ kk_cmd_new_pre_gfx_cmd_buf(struct kk_cmd_buffer *cmd)
+@@ -395,6 +494,7 @@ kk_cmd_new_pre_gfx_cmd_buf(struct kk_cmd_buffer *cmd)
        util_dynarray_num_elements(&cmd->metal.cmd_bufs, mtl_command_buffer *);
     cmd_bufs[count - 2u] = cmd_buf;
     cmd->metal.pre_gfx.cmd_buf = cmd_buf;
@@ -278,7 +279,7 @@ index 0e00989..e34d243 100644
     return true;
  }
  
-@@ -419,6 +518,8 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+@@ -419,6 +519,8 @@ cs_start_render(struct kk_cmd_buffer *cmd)
     cmd->metal.render_first = !cmd->metal.cmd_buf_used;
     cmd->metal.cmd_buf_used = true;
  
@@ -287,7 +288,7 @@ index 0e00989..e34d243 100644
     cmd->metal.render = mtl_new_render_command_encoder_with_descriptor(
        cmd->metal.cmd_buf, state->render_pass_descriptor);
  
-@@ -491,6 +592,8 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
+@@ -491,6 +593,8 @@ cs_get_compute(struct kk_cmd_buffer *cmd)
     }
  
     if (cmd->metal.compute == NULL) {
@@ -296,7 +297,7 @@ index 0e00989..e34d243 100644
        cmd->metal.compute = mtl_new_compute_command_encoder(cmd->metal.cmd_buf);
        cmd->metal.cmd_buf_used = true;
        mtl_compute_set_argument_table(cmd->metal.compute, cmd->argument_table);
-@@ -532,6 +635,8 @@ cs_get_pre_gfx(struct kk_cmd_buffer *cmd)
+@@ -532,6 +636,8 @@ cs_get_pre_gfx(struct kk_cmd_buffer *cmd)
         (!cmd->metal.render_first || !kk_cmd_new_pre_gfx_cmd_buf(cmd)))
        return cs_get_compute(cmd);
  
@@ -305,7 +306,7 @@ index 0e00989..e34d243 100644
     mtl_compute_encoder *encoder =
        mtl_new_compute_command_encoder(cmd->metal.pre_gfx.cmd_buf);
     mtl_compute_set_argument_table(encoder, cmd->argument_table);
-@@ -563,6 +668,7 @@ end_pre_gfx(struct kk_cmd_buffer *cmd)
+@@ -563,6 +669,7 @@ end_pre_gfx(struct kk_cmd_buffer *cmd)
  static void
  end_encoder(struct kk_cmd_buffer *cmd, mtl_command_encoder *encoder)
  {
