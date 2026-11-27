@@ -1,5 +1,7 @@
 # steamac — Valve's official ARM64 SteamOS (the Steam Frame image) in a VM on Apple Silicon
 
+> **Note (`gaming-mac` fork):** This repository is a performance-optimized, security-hardened fork of [`fxgl/steamac`](https://github.com/fxgl/steamac) with built-in ARM64 Epic Games (Heroic) integration. See [**GAMING-MAC.md**](GAMING-MAC.md) for all fork changes, `steamac-epic` usage, and external-SSD build notes.
+
 **English** · [Русский](README.ru.md) · [简体中文](README.zh.md)
 
 On macOS 15 (Sequoia), Valve's actual SteamOS for Steam Frame runs in a lightweight VM on
