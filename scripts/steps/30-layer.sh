@@ -107,6 +107,8 @@ done
     || { echo "[layer] usr/lib/steamac/steam-compat-default missing or not executable" >&2; exit 1; }
 [[ -x $ST/usr/lib/steamac/steam-dxmt-arm64ec ]] \
     || { echo "[layer] usr/lib/steamac/steam-dxmt-arm64ec missing or not executable" >&2; exit 1; }
+[[ -x $ST/usr/lib/steamac/steamac-epic ]] \
+    || { echo "[layer] usr/lib/steamac/steamac-epic missing or not executable" >&2; exit 1; }
 [[ -f $ST/usr/lib/systemd/user/steam.service.d/50-steamac.conf ]] \
     || { echo "[layer] steam.service drop-in missing" >&2; exit 1; }
 [[ ! -e $ST/usr/lib/systemd/user/steam.service && ! -e $ST/usr/share/deckard/RUNSTEAM.sh ]] \

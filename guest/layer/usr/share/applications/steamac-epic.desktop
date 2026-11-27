@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Epic Games (Heroic)
+Comment=Install and launch Epic Games via Heroic with Steam Proton, FEX, Venus/KosmicKrisp, and DXMT
+Exec=/usr/lib/steamac/steamac-epic launch
+Icon=applications-games
+Terminal=false
+Categories=Game;
+StartupNotify=true

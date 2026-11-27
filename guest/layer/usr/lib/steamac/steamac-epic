@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Epic Games (Heroic Games Launcher) integration for gaming-mac / steamac.
+
+Heroic (`com.heroicgameslauncher.hgl`) ships natively for ARM64 Linux on Flathub
+and handles Epic OAuth, downloads (legendary), cloud saves, EOS overlay, and
+automatic Steam Gaming Mode shortcuts. Out of the box, however, the Flatpak
+sandbox cannot see Steam's FEX-enabled Proton installations or steamac's Venus
+VRAM budget (`gfx.txt`) and DXMT configuration.
+
+Commands:
+  steamac-epic status                 Inspect Flatpak, Heroic, and Steam Proton tools
+  steamac-epic setup [--no-install]   Configure Flathub, Heroic Flatpak, overrides, and seed config
+  steamac-epic launch [args...]       Ensure Heroic is set up, then launch it
+  steamac-epic run-game -- <cmd...>   Wrapper applying steamac Venus/DXMT/FEX env to Epic games
+"""
+
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+HEROIC_APP_ID = "com.heroicgameslauncher.hgl"
+FLATHUB_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
+DEFAULT_STEAM_ROOT = pathlib.Path.home() / ".local/share/Steam"
+DEFAULT_HEROIC_CONFIG = (
+    pathlib.Path.home() / ".var/app" / HEROIC_APP_ID / "config/heroic/config.json"
+)
+WRAPPER_BIN = "/usr/lib/steamac/steamac-epic"
+
+# Safe environment key/value pattern matching steam-gfx-env / gfx.txt conventions.
+ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+
+
+def parse_gpu_budget_mib(cmdline_path=pathlib.Path("/proc/cmdline")):
+    """Read steamac.gpu_mib=<N> from /proc/cmdline with strict range validation."""
+    try:
+        text = pathlib.Path(cmdline_path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    budget = None
+    for word in text.split():
+        if word.startswith("steamac.gpu_mib="):
+            raw = word.split("=", 1)[1]
+            if raw.isdigit() and len(raw) <= 5:
+                val = int(raw, 10)
+                if 256 <= val <= 16384:
+                    budget = val
+    return budget
+
+
+def parse_env_file(path):
+    """Parse simple KEY=VALUE lines (like steamac's gfx.txt) without shell evaluation."""
+    env = {}
+    try:
+        lines = pathlib.Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return env
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not ENV_KEY_RE.match(key):
+            continue
+        env[key] = value.strip()
+    return env
+
+
+def build_dxmt_config(existing="", gpu_mib=None):
+    """Compose DXMT_CONFIG defaults while letting explicit user settings override them."""
+    defaults = ["d3d11.cpuCachedDynamicResources=True"]
+    if gpu_mib is not None:
+        defaults.append(f"dxgi.customVideoMemory={gpu_mib}")
+    base = ";".join(defaults)
+    existing = (existing or "").strip()
+    return f"{base};{existing}" if existing else base
+
+
+def build_game_env(
+    base_env=None,
+    runtime_dir=None,
+    config_home=None,
+    cmdline_path=pathlib.Path("/proc/cmdline"),
+):
+    """Build the runtime environment for an Epic/Non-Steam game launched under steamac."""
+    env = dict(os.environ if base_env is None else base_env)
+
+    xdg_runtime = pathlib.Path(
+        runtime_dir if runtime_dir is not None else env.get("XDG_RUNTIME_DIR", "")
+    )
+    xdg_config = pathlib.Path(
+        config_home
+        if config_home is not None
+        else env.get("XDG_CONFIG_HOME", str(pathlib.Path.home() / ".config"))
+    )
+
+    # Apply steam-gfx-env defaults first, then user overrides (same precedence as steam-launch-wrapper).
+    if str(xdg_runtime):
+        env.update(parse_env_file(xdg_runtime / "steam/env/gfx.txt"))
+    env.update(parse_env_file(xdg_config / "steam/env/gfx.txt"))
+
+    env.setdefault("FEX_X87REDUCEDPRECISION", "1")
+    env.setdefault("PROTON_USE_NTSYNC", "1")
+
+    gpu_mib = parse_gpu_budget_mib(cmdline_path)
+    env["DXMT_CONFIG"] = build_dxmt_config(env.get("DXMT_CONFIG", ""), gpu_mib=gpu_mib)
+    return env
+
+
+def discover_proton_tools(steam_root=DEFAULT_STEAM_ROOT):
+    """Find Steam Proton / FEX / DXMT compatibility tools sorted by preference."""
+    steam_root = pathlib.Path(steam_root)
+    candidates = []
+
+    compat_dir = steam_root / "compatibilitytools.d"
+    if compat_dir.is_dir():
+        for entry in sorted(compat_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            proton_bin = entry / "proton"
+            if not proton_bin.is_file():
+                continue
+            name = entry.name
+            is_dxmt_arm64ec = "dxmt" in name.lower() and "arm64ec" in name.lower()
+            rank = 0 if is_dxmt_arm64ec else 40
+            candidates.append(
+                {
+                    "rank": rank,
+                    "name": name,
+                    "bin": str(proton_bin),
+                    "type": "proton",
+                    "dxmt": (entry / "files/lib/wine/.steamac-dxmt").is_file()
+                    or is_dxmt_arm64ec,
+                }
+            )
+
+    common_dir = steam_root / "steamapps/common"
+    if common_dir.is_dir():
+        for entry in sorted(common_dir.iterdir()):
+            if not entry.is_dir() or not entry.name.startswith("Proton"):
+                continue
+            proton_bin = entry / "proton"
+            if not proton_bin.is_file():
+                continue
+            name = entry.name
+            if "11" in name:
+                rank = 10
+            elif "Experimental" in name:
+                rank = 20
+            elif "10" in name:
+                rank = 30
+            else:
+                rank = 50
+            candidates.append(
+                {
+                    "rank": rank,
+                    "name": name,
+                    "bin": str(proton_bin),
+                    "type": "proton",
+                    "dxmt": (entry / "files/lib/wine/.steamac-dxmt").is_file(),
+                }
+            )
+
+    candidates.sort(key=lambda c: (c["rank"], c["name"]))
+    return candidates
+
+
+def select_best_proton(steam_root=DEFAULT_STEAM_ROOT, prefer_dxmt=False):
+    """Pick the highest-priority Proton tool for Heroic."""
+    tools = discover_proton_tools(steam_root)
+    if not tools:
+        return None
+    if prefer_dxmt:
+        for t in tools:
+            if t["dxmt"]:
+                return t
+    else:
+        for t in tools:
+            if not t["dxmt"]:
+                return t
+    return tools[0]
+
+
+def flatpak_override_args(
+    steam_root=DEFAULT_STEAM_ROOT,
+    runtime_dir=None,
+    gpu_mib=None,
+):
+    """Build the minimal Flatpak override arguments for Heroic on steamac."""
+    steam_path = str(pathlib.Path(steam_root))
+    dxmt_cfg = build_dxmt_config("", gpu_mib=gpu_mib)
+    args = [
+        "flatpak",
+        "--user",
+        "override",
+        HEROIC_APP_ID,
+        f"--filesystem={steam_path}:rw",
+        "--filesystem=/usr/lib/steamac:ro",
+        "--device=dri",
+        "--socket=wayland",
+        "--socket=x11",
+        "--socket=pulseaudio",
+        "--env=FEX_X87REDUCEDPRECISION=1",
+        "--env=PROTON_USE_NTSYNC=1",
+        f"--env=DXMT_CONFIG={dxmt_cfg}",
+    ]
+    if runtime_dir:
+        args.append(f"--filesystem={pathlib.Path(runtime_dir) / 'steam/env'}:ro")
+    return args
+
+
+def seed_heroic_config(
+    config_path=DEFAULT_HEROIC_CONFIG,
+    steam_root=DEFAULT_STEAM_ROOT,
+    prefer_dxmt=False,
+    wrapper_bin=WRAPPER_BIN,
+):
+    """Write an initial Heroic config.json if none exists yet (never clobbers user config)."""
+    config_path = pathlib.Path(config_path)
+    if config_path.exists():
+        return False
+
+    proton = select_best_proton(steam_root, prefer_dxmt=prefer_dxmt)
+    default_settings = {
+        "autoUpdateGames": False,
+        "addToSteam": True,
+        "useSteamRuntime": True,
+        "wrapperOptions": [
+            {"exe": wrapper_bin, "args": "run-game --"},
+        ],
+    }
+    if proton is not None:
+        default_settings["wineVersion"] = {
+            "bin": proton["bin"],
+            "name": f"Proton - {proton['name']}",
+            "type": "proton",
+        }
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = config_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"defaultSettings": default_settings}, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(config_path)
+    return True
+
+
+def is_heroic_installed():
+    if not shutil.which("flatpak"):
+        return False
+    res = subprocess.run(
+        ["flatpak", "info", HEROIC_APP_ID],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return res.returncode == 0
+
+
+def cmd_status(steam_root=DEFAULT_STEAM_ROOT, config_path=DEFAULT_HEROIC_CONFIG):
+    has_flatpak = shutil.which("flatpak") is not None
+    installed = is_heroic_installed() if has_flatpak else False
+    tools = discover_proton_tools(steam_root)
+    gpu_mib = parse_gpu_budget_mib()
+    print(f"flatpak:  {'available' if has_flatpak else 'missing'}")
+    print(f"heroic:   {'installed' if installed else 'not installed'} ({HEROIC_APP_ID})")
+    print(f"config:   {'present' if pathlib.Path(config_path).exists() else 'not initialized'} ({config_path})")
+    print(f"gpu_mib:  {gpu_mib if gpu_mib is not None else 'unset'}")
+    if tools:
+        print("proton:   " + ", ".join(t["name"] for t in tools))
+    else:
+        print("proton:   none found under " + str(steam_root))
+    return 0
+
+
+def cmd_setup(no_install=False, prefer_dxmt=False):
+    if not shutil.which("flatpak"):
+        print("steamac-epic: flatpak is not installed in this environment", file=sys.stderr)
+        return 1
+
+    if not no_install:
+        subprocess.run(
+            ["flatpak", "remote-add", "--user", "--if-not-exists", "flathub", FLATHUB_URL],
+            check=True,
+        )
+        if not is_heroic_installed():
+            subprocess.run(
+                [
+                    "flatpak",
+                    "--user",
+                    "install",
+                    "-y",
+                    "--noninteractive",
+                    "flathub",
+                    HEROIC_APP_ID,
+                ],
+                check=True,
+            )
+
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    gpu_mib = parse_gpu_budget_mib()
+    subprocess.run(
+        flatpak_override_args(DEFAULT_STEAM_ROOT, runtime_dir=runtime_dir, gpu_mib=gpu_mib),
+        check=True,
+    )
+    created = seed_heroic_config(
+        DEFAULT_HEROIC_CONFIG,
+        steam_root=DEFAULT_STEAM_ROOT,
+        prefer_dxmt=prefer_dxmt,
+    )
+    print(
+        f"steamac-epic: configured {HEROIC_APP_ID} "
+        f"({'seeded config.json' if created else 'kept existing config.json'})"
+    )
+    return 0
+
+
+def cmd_run_game(argv):
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        print("usage: steamac-epic run-game -- <command> [args...]", file=sys.stderr)
+        return 2
+    env = build_game_env()
+    os.execvpe(argv[0], argv, env)
+
+
+def cmd_launch(extra_args):
+    if not is_heroic_installed():
+        rc = cmd_setup(no_install=False)
+        if rc != 0:
+            return rc
+    else:
+        seed_heroic_config(DEFAULT_HEROIC_CONFIG, steam_root=DEFAULT_STEAM_ROOT)
+    cmd = ["flatpak", "run", HEROIC_APP_ID] + list(extra_args)
+    os.execvp(cmd[0], cmd)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    sub = argv[0]
+    rest = argv[1:]
+    if sub == "status":
+        return cmd_status()
+    if sub == "setup":
+        return cmd_setup(
+            no_install="--no-install" in rest,
+            prefer_dxmt="--dxmt" in rest or os.environ.get("STEAMAC_DXMT") == "1",
+        )
+    if sub == "launch":
+        return cmd_launch(rest)
+    if sub == "run-game":
+        return cmd_run_game(rest)
+    print(f"steamac-epic: unknown command: {sub}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
