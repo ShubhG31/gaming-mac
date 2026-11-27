@@ -40,6 +40,9 @@ enum Fail {
 const MAX_CURSOR_DIMENSION: u16 = 256;
 const POINTER_INTERVAL: Duration = Duration::from_micros(16_667);
 const SELECT_INTERVAL: Duration = Duration::from_millis(250);
+// Once an active game window is selected, X11 PropertyNotify / ConfigureNotify / DestroyNotify
+// events already trigger immediate re-selection; only poll slowly as a fallback.
+const SELECT_IDLE_INTERVAL: Duration = Duration::from_secs(2);
 const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(PartialEq)]
@@ -180,8 +183,13 @@ impl Cursor {
             return None;
         }
         let mut deadline = self.next_scan.min(self.next_select);
-        if self.target.is_some() {
-            deadline = deadline.min(self.next_poll);
+        // Only run the 60 Hz pointer timer while a visible cursor needs position tracking or
+        // an XFixes CursorNotify marked the cursor image dirty; hidden game cursors stay idle.
+        if let Some(target) = self.target {
+            let dirty = self.conns.get(target.conn).is_some_and(|c| c.image_dirty);
+            if dirty || self.sent.image.is_some() {
+                deadline = deadline.min(self.next_poll);
+            }
         }
         let left = deadline.saturating_duration_since(Instant::now());
         // Round up: a sub-millisecond remainder must not busy-loop.
@@ -276,8 +284,8 @@ impl Cursor {
             }
         }
         if now >= self.next_select {
-            self.next_select = now + SELECT_INTERVAL;
             let target = self.select_target();
+            self.next_select = now + if target.is_some() { SELECT_IDLE_INTERVAL } else { SELECT_INTERVAL };
             if target != self.target {
                 self.sent.hide(|line| port.send_quiet(line));
                 if let Some(t) = target {
@@ -292,6 +300,9 @@ impl Cursor {
             return;
         };
         let dirty = self.conns[target.conn].image_dirty;
+        if !dirty && self.sent.image.is_none() {
+            return;
+        }
         if now < self.next_poll && !dirty {
             return;
         }
@@ -453,5 +464,22 @@ mod tests {
         assert!(!game_class(b"Steam\0steam\0"));
         assert!(!game_class(b"not_steam_app_570\0"));
         assert!(!game_class(b""));
+    }
+
+    #[test]
+    fn hidden_cursor_does_not_arm_60hz_pointer_poll() {
+        let mut cursor = Cursor::new();
+        cursor.set_tracking(true);
+        let now = Instant::now();
+        cursor.next_scan = now + SCAN_INTERVAL;
+        cursor.next_select = now + SELECT_IDLE_INTERVAL;
+        cursor.next_poll = now;
+        cursor.target = Some(Target { conn: 0, window: 1, width: 1280, height: 800 });
+        // Hidden cursor (sent.image == None) with no dirty conn skips the 16.67 ms poll timer.
+        let hidden_wait = cursor.wait_ms().unwrap();
+        assert!(hidden_wait > 500, "expected idle wait > 500ms, got {hidden_wait}ms");
+        // Visible cursor re-arms the 60 Hz pointer timer immediately.
+        cursor.sent.image = Some(image(0xff112233));
+        assert!(cursor.wait_ms().unwrap() <= 20);
     }
 }

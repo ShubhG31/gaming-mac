@@ -170,24 +170,33 @@ index 8686f55d..ab1beffa 100644
  	return PR_SET_MEM_MODEL_DEFAULT;
  }
  
-@@ -742,6 +747,23 @@ int arch_prctl_mem_model_set(struct task_struct *t, unsigned long val)
+@@ -742,6 +747,32 @@ int arch_prctl_mem_model_set(struct task_struct *t, unsigned long val)
  	    val == PR_SET_MEM_MODEL_TSO)
  		return 0;
  
 +	if (alternative_has_cap_unlikely(ARM64_HAS_TSO_APPLE)) {
++		u64 actlr;
++
 +		WARN_ON(!system_has_actlr_state());
 +
++		preempt_disable();
++		actlr = t->thread.actlr;
 +		switch (val) {
 +		case PR_SET_MEM_MODEL_TSO:
-+			t->thread.actlr |= ACTLR_APPLE_TSO;
++			actlr |= ACTLR_APPLE_TSO;
 +			break;
 +		case PR_SET_MEM_MODEL_DEFAULT:
-+			t->thread.actlr &= ~ACTLR_APPLE_TSO;
++			actlr &= ~ACTLR_APPLE_TSO;
 +			break;
 +		default:
++			preempt_enable();
 +			return -EINVAL;
 +		}
-+		write_sysreg(t->thread.actlr, actlr_el1);
++		if (actlr != t->thread.actlr) {
++			t->thread.actlr = actlr;
++			write_sysreg(actlr, actlr_el1);
++		}
++		preempt_enable();
 +		return 0;
 +	}
 +

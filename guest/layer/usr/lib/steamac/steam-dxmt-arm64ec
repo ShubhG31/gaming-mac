@@ -49,6 +49,17 @@ RUN = """#!/bin/sh
 # directory from the path it is started as.
 here=${0%/*}
 export WINEDLLPATH="$here/dxmt${WINEDLLPATH:+:$WINEDLLPATH}"
+# Enable UMA CPU-cached dynamic resources and report the launcher's unified-memory GPU budget
+# to DXMT unless overridden by the user's DXMT_CONFIG.
+dxmt_cfg="d3d11.cpuCachedDynamicResources=True"
+if [ -r /proc/cmdline ]; then
+    for w in $(cat /proc/cmdline); do
+        case $w in
+            steamac.gpu_mib=[0-9]*) dxmt_cfg="$dxmt_cfg;dxgi.customVideoMemory=${w#steamac.gpu_mib=}" ;;
+        esac
+    done
+fi
+export DXMT_CONFIG="${dxmt_cfg}${DXMT_CONFIG:+;$DXMT_CONFIG}"
 if [ -n "${STEAM_COMPAT_DATA_PATH:-}" ]; then
     s=$STEAM_COMPAT_DATA_PATH/pfx/drive_c/windows/system32
     # a new prefix: proton creates it first, then it gets the winemetal entry
@@ -124,7 +135,7 @@ def available(source, destination):
         if receipt.get("v") != 3 or any(receipt.get(k) != v for k, v in source_receipt(source.resolve()).items()):
             return False
         tool = destination / "tool"
-        paths = REQUIRED + ("run", "dxmt/aarch64-unix/winemetal.so",
+        paths = REQUIRED + ("run", "files/lib/wine/.steamac-dxmt", "dxmt/aarch64-unix/winemetal.so",
                            "dxmt/aarch64-windows/winemetal.dll", "dxmt/x86_64-windows/winemetal.dll")
         paths += tuple("files/lib/wine/dxvk/aarch64-windows/" + dll + ".dll" for dll in DXVK)
         return (destination / "compatibilitytool.vdf").is_file() and all((tool / p).is_file() for p in paths)
@@ -230,6 +241,8 @@ def install(source, payload, destination):
             (tool / "dxmt" / arch).mkdir(parents=True)
             shutil.copyfile(payload / source_arch / name, tool / "dxmt" / arch / name)
         apply_fixups(source, tool)
+        # Mark the tool so fx-progress-agent (games.rs) recognizes native ARM64EC DXMT runs.
+        (tool / "files/lib/wine/.steamac-dxmt").touch()
         (tool / "run").write_text(RUN)
         (tool / "run").chmod(0o755)
         (tool / "toolmanifest.vdf").write_text(manifest.replace(COMMANDLINE, '"/run %verb%"'))

@@ -57,8 +57,10 @@ native_copy() { # src dst
         && mv -f "$2.steamac-tmp" "$2"
 }
 same_as_native() { # payload file, candidate
-    local t; t=$(mktemp); cp "$1" "$t"; dd if=/dev/zero of="$t" bs=1 seek=64 count=16 conv=notrunc status=none
-    cmp -s "$t" "$2"; local rc=$?; rm -f "$t"; return $rc
+    [[ -f $1 && -f $2 ]] || return 1
+    cmp -s <(head -c 64 "$1") <(head -c 64 "$2") \
+        && cmp -s <(head -c 16 /dev/zero) <(tail -c +65 "$2" | head -c 16) \
+        && cmp -s "$1" "$2" 80 80
 }
 install_file() { cmp -s "$1" "$2" || { cp -f "$1" "$2.steamac-tmp" && mv -f "$2.steamac-tmp" "$2"; }; }
 # A DXMT file this script installed, from this or an earlier DXMT payload (a layer update changes the payload):

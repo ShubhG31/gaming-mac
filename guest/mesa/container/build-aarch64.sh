@@ -11,14 +11,16 @@ pacman -Sy --noconfirm --needed \
     libdrm wayland wayland-protocols libx11 libxcb libxshmfence libxrandr libxext libxfixes libxxf86vm \
     libglvnd xcb-proto xorgproto vulkan-headers systemd-libs zstd expat zlib
 
-build_venus /tmp/build-aarch64 lib /tmp/dest-aarch64
+ARCH_OPTS=(-Dc_args=-march=armv8.4-a+lse -Dcpp_args=-march=armv8.4-a+lse)
+
+build_venus /tmp/build-aarch64 lib /tmp/dest-aarch64 "${ARCH_OPTS[@]}"
 
 install -D -m 0755 /tmp/dest-aarch64/usr/lib/libvulkan_virtio.so /out/usr/lib/libvulkan_virtio.so
 install -D -m 0644 /tmp/dest-aarch64/usr/share/vulkan/icd.d/virtio_icd.aarch64.json \
     /out/usr/share/vulkan/icd.d/virtio_icd.aarch64.json
 
 # GL: patched zink over the image's own (stock deckard-mesa) GL files of the same names
-build_gl /tmp/build-gl-aarch64 lib /tmp/dest-gl-aarch64
+build_gl /tmp/build-gl-aarch64 lib /tmp/dest-gl-aarch64 "${ARCH_OPTS[@]}"
 install_gl /tmp/dest-gl-aarch64 lib /out
 
 mkdir -p /work/bin

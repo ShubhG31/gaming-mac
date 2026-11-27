@@ -71,7 +71,7 @@ GAMESCOPE_SESSION_TARGET="${GAMESCOPE_SESSION_TARGET:-gamescope-session.target}"
 WATCH_SERVICE=
 if [[ "${GAMESCOPE_SESSION_TARGET}" == "gamescope-session.target" ]]; then
   GAMESCOPE_ARGS+=(--keep-alive --steam)
-  [[ "${STEAMAC_GAMESCOPE_MANGOAPP:-1}" == 1 ]] && GAMESCOPE_ARGS+=(--mangoapp)
+  [[ "${STEAMAC_GAMESCOPE_MANGOAPP:-0}" == 1 ]] && GAMESCOPE_ARGS+=(--mangoapp)
 elif [[ "${GAMESCOPE_SESSION_TARGET}" == "plasma-session.target" ]]; then
   # Desktop Mode (stock logic): gamescope-onready starts the nested Plasma
   # desktop once DISPLAY is published and waits for it; without --keep-alive

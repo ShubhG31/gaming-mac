@@ -77,7 +77,7 @@ index 083f0e45..8686f55d 100644
  
 +#ifdef CONFIG_ARM64_ACTLR_STATE
 +		if (system_has_actlr_state())
-+			p->thread.actlr = read_sysreg(actlr_el1);
++			p->thread.actlr = current->thread.actlr;
 +#endif
 +
  		if (stack_start) {
@@ -97,8 +97,8 @@ index 083f0e45..8686f55d 100644
 +	if (!system_has_actlr_state())
 +		return;
 +
-+	current->thread.actlr = read_sysreg(actlr_el1);
-+	write_sysreg(next->thread.actlr, actlr_el1);
++	if (unlikely(current->thread.actlr != next->thread.actlr))
++		write_sysreg(next->thread.actlr, actlr_el1);
 +}
 +#else
 +static inline void actlr_thread_switch(struct task_struct *next)
