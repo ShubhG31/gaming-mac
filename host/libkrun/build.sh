@@ -118,6 +118,11 @@ done
 	# which ld and dyld reject for images built against the macOS 27 SDK ("mis-aligned LINKEDIT
 	# string pool"; rust-lang/rust#157750, fixed in LLVM by llvm/llvm-project#203680).
 	export CARGO_PROFILE_RELEASE_STRIP=false
+	# Upstream Cargo.toml already sets lto = true and aarch64-apple-darwin already defaults to
+	# apple-m1 (with LSE atomics); single codegen unit maximizes optimization and LIBKRUN_TARGET_CPU
+	# lets local builds opt into newer Apple Silicon scheduling (e.g. LIBKRUN_TARGET_CPU=native).
+	export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+	export CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS="-C target-cpu=${LIBKRUN_TARGET_CPU:-apple-m1}"
 	# shellcheck disable=SC2086
 	make $MAKE_FLAGS
 	make PREFIX="$out" libkrun.pc
